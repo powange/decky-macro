@@ -12,7 +12,7 @@ This fork adds analog stick and trigger recording. On the Steam Deck, open Decky
 https://github.com/powange/decky-macro/releases/latest/download/decky-macro.zip
 ```
 
-The same URL always points to the latest release, so re-installing from it updates the plugin. Releases are built by GitHub Actions when a `v*` tag is pushed (`.github/workflows/release.yml`).
+The same URL always points to the latest release, so re-installing from it updates the plugin. Releases are built by GitHub Actions (`.github/workflows/release.yml`) on every push to `main` whose `package.json` version has no release yet: bump the version to publish a new one.
 
 ## Features
 
