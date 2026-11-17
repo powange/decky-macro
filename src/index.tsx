@@ -266,7 +266,7 @@ function Content() {
 
       <PanelSection>
         <div style={{ padding: "0 10px 10px 10px", fontSize: "12px", color: "#ffcc00", fontWeight: "bold" }}>
-          NOTE: currently only supports digital buttons, not analog ones (trigger/sticks).
+          Analog sticks and triggers (L2/R2) are recorded in 4 steps per direction (25/50/75/100%). Pushing a stick past halfway cancels playback.
         </div>
         <PanelSectionRow>
           <ToggleField

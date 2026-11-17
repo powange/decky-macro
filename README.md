@@ -4,6 +4,16 @@ A Decky Loader plugin for the Steam Deck that allows you to easily record and re
 
 Built with a blazing-fast, low-level Rust daemon that interfaces directly with the Linux `evdev` subsystem, ensuring 1:1 input reproduction without lag or dropped inputs.
 
+## Installing this fork (analog support)
+
+This fork adds analog stick and trigger recording. On the Steam Deck, open Decky settings > Developer > *Install plugin from URL* and paste:
+
+```
+https://github.com/powange/decky-macro/releases/latest/download/decky-macro.zip
+```
+
+The same URL always points to the latest release, so re-installing from it updates the plugin. Releases are built by GitHub Actions when a `v*` tag is pushed (`.github/workflows/release.yml`).
+
 ## Features
 
 - **Live Macro Recording:** Instantly record gamepad sequences directly during gameplay.
@@ -17,12 +27,12 @@ Built with a blazing-fast, low-level Rust daemon that interfaces directly with t
 
 ## Limitations & Best Practices
 
-- **Digital Inputs Only:** For extreme precision and to save memory, this plugin explicitly ignores analog stick movement (`ABS_X`/`ABS_Y`) and analog triggers (`ABS_Z`). **You must use the D-Pad for directional macros.**
+- **Analog Inputs:** Sticks (`ABS_X`/`ABS_Y`, `ABS_RX`/`ABS_RY`) and triggers (`ABS_Z`/`ABS_RZ`, or `ABS_HAT2X`/`ABS_HAT2Y` on the native Deck device) are recorded from gamepads only (motion sensors and touchscreen are ignored). They are quantized to **4 steps per direction** (25/50/75/100%), with hysteresis so a stick held on a boundary doesn't flap; only step changes are stored. Every macro ends with the axes back at rest. During playback, pushing a stick or trigger past 50% cancels the macro (when cancel-on-input is enabled). Buttons are stored as a press and a release, so hold durations are replayed exactly.
 - **Hardware Triggers:** Make sure your physical buttons (like the back paddles `L4`/`R4`) are mapped to the configured trigger buttons (e.g., `L3`/`R3`) via Steam Input.
 
 ## Macro Data Format & Limits
 
-- **Maximum Size:** Each macro can record a maximum of **5,000 events**. Once this limit is hit, recording stops automatically and saves.
+- **Maximum Size:** Each macro can record a maximum of **20,000 events**. Once this limit is hit, recording stops automatically and saves.
 - **Format:** Macros are saved in `~/homebrew/settings/decky-macro/macro_<slot>.json`. They are simple JSON arrays containing the delay (in milliseconds since the last event), and the raw `evdev` event type, code, and value.
   ```json
   [
