@@ -1,0 +1,84 @@
+name: Release
+
+# On every push to main, builds the plugin and publishes a GitHub release
+# tagged v<version from package.json> if that release doesn't exist yet.
+# Bump "version" in package.json to publish a new release.
+#
+# The zip is always named decky-macro.zip, so this URL always points to the
+# latest version (Decky > Developer > Install plugin from URL):
+#   https://github.com/powange/decky-macro/releases/latest/download/decky-macro.zip
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="v$(jq -r .version package.json)"
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, nothing to publish."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: pnpm/action-setup@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.exists == 'false'
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Test daemon
+        if: steps.version.outputs.exists == 'false'
+        run: cargo test --release --manifest-path backend/Cargo.toml
+
+      - name: Build frontend
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      # Static musl binary: runs on SteamOS regardless of the runner's glibc.
+      - name: Build daemon
+        if: steps.version.outputs.exists == 'false'
+        run: DECKY_MACRO_TARGET=static sh backend/build.sh
+
+      - name: Package
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          pnpm run package
+          cd target && zip -r ../decky-macro.zip decky-macro
+
+      - name: Publish release
+        if: steps.version.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.version.outputs.tag }}
+          files: decky-macro.zip
+          generate_release_notes: true
+          make_latest: true
