@@ -248,7 +248,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
       <div style={{ padding: "0 0 20px 0" }}>
         <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "12px", lineHeight: "1.3" }}>
           These settings are read when the daemon starts. Stop the daemon before changing them.
-          The Deck does not expose its back buttons (L4/L5/R4/R5) to the daemon: map one to a keyboard key in the game's Steam Input layout (e.g. F10), then use Detect and press it. Detection works while a game has focus: press Detect, close the menu with the ··· button, then press your button within 10 seconds.
+          Back buttons (L4/L5/R4/R5) are read directly from the Deck controller, so they can be picked from the list or detected. Detect: press it, then press the button within 10 seconds (touches, A and B are ignored).
         </div>
 
         <div style={{ marginBottom: "5px" }}><b>Record Trigger:</b></div>

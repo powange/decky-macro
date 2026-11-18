@@ -371,6 +371,96 @@ fn inject(
     }
 }
 
+// ---- Steam Deck back buttons (L4/L5/R4/R5) ----
+// Steam's virtual gamepad has no back buttons, and hid-steam stops its own
+// evdev device while Steam runs. So they are read from the Deck controller's
+// raw HID reports (hidraw), alongside Steam: every hidraw reader gets its own
+// copy of each report, nothing is modified. Report layout (hid-steam.c):
+// 64 bytes, data[0]=1, data[1]=0, data[2]=9 (ID_CONTROLLER_DECK_STATE).
+const VALVE_VID: &str = "000028DE";
+const STEAM_DECK_PID: &str = "00001205";
+const DECK_PADDLES: [(u16, usize, u8); 4] = [
+    (0x224, 13, 1), // L4  BTN_GRIPL
+    (0x225, 13, 2), // R4  BTN_GRIPR
+    (0x226, 9, 7),  // L5  BTN_GRIPL2
+    (0x227, 10, 0), // R5  BTN_GRIPR2
+];
+/// Pseudo device path used for back-button events read from hidraw.
+const DECK_PADDLES_PATH: &str = "hidraw:steam-deck-back-buttons";
+
+fn is_paddle_code(code: u16) -> bool {
+    DECK_PADDLES.iter().any(|(c, _, _)| *c == code)
+}
+
+/// Returns the paddle state (code, pressed) changes between two reports.
+fn paddle_changes(report: &[u8], last: &mut [bool; 4]) -> Vec<(u16, bool)> {
+    let mut out = Vec::new();
+    if report.len() != 64 || report[0] != 1 || report[1] != 0 || report[2] != 9 {
+        return out;
+    }
+    for (i, (code, byte, bit)) in DECK_PADDLES.iter().enumerate() {
+        let pressed = report[*byte] & (1 << bit) != 0;
+        if pressed != last[i] {
+            last[i] = pressed;
+            out.push((*code, pressed));
+        }
+    }
+    out
+}
+
+fn find_deck_hidraw() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Ok(dir) = fs::read_dir("/sys/class/hidraw") {
+        for entry in dir.flatten() {
+            let uevent = entry.path().join("device/uevent");
+            if let Ok(text) = fs::read_to_string(&uevent) {
+                let up = text.to_uppercase();
+                if up.contains(&format!(":{}:{}", VALVE_VID, STEAM_DECK_PID)) {
+                    found.push(PathBuf::from("/dev").join(entry.file_name()));
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Starts one reader thread per Deck hidraw node; `on_change(code, pressed)`
+/// is called on every back-button press/release. Returns the number of nodes.
+fn spawn_paddle_readers<F>(on_change: F) -> usize
+where
+    F: Fn(u16, bool) + Send + Clone + 'static,
+{
+    let nodes = find_deck_hidraw();
+    for node in &nodes {
+        let node = node.clone();
+        let cb = on_change.clone();
+        thread::spawn(move || {
+            use std::io::Read;
+            let mut file = match fs::File::open(&node) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!("Cannot open {:?} for back buttons: {}", node, e);
+                    return;
+                }
+            };
+            let mut buf = [0u8; 64];
+            let mut last = [false; 4];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        for (code, pressed) in paddle_changes(&buf[..n], &mut last) {
+                            cb(code, pressed);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+    }
+    nodes.len()
+}
+
 /// Keys a trigger can be learnt from. Excludes A/B (used to navigate the Steam
 /// UI), mouse buttons (trackpad clicks) and touch/digitizer events such as
 /// BTN_TOUCH, which the touchscreen and trackpads send on every contact.
@@ -416,9 +506,20 @@ fn detect_button(timeout_ms: u64) -> Result<()> {
             }
         }
     }
+    let tx_paddles = tx.clone();
+    spawn_paddle_readers(move |code, pressed| {
+        if pressed {
+            let _ = tx_paddles.send((code, "Steam Deck back buttons (hidraw)".to_string()));
+        }
+    });
     match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
         Ok((code, device)) => {
-            println!("DETECTED {} {:?} {}", code, Key::new(code), device);
+            let label = if is_paddle_code(code) {
+                key_label(code).split(' ').next().unwrap_or("?").to_string()
+            } else {
+                format!("{:?}", Key::new(code))
+            };
+            println!("DETECTED {} {} {}", code, label, device);
             Ok(())
         }
         Err(_) => {
@@ -491,6 +592,23 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let tx_discovery = tx.clone();
     let (record_code, replay_code) = (config.trigger_record_code, config.trigger_replay_code);
+
+    let tx_paddles = tx.clone();
+    let paddle_path = PathBuf::from(DECK_PADDLES_PATH);
+    let paddle_nodes = spawn_paddle_readers(move |code, pressed| {
+        let ev = InputEvent::new(evdev::EventType::KEY, code, pressed as i32);
+        let _ = tx_paddles.send(Msg::Input(paddle_path.clone(), ev));
+    });
+    if paddle_nodes > 0 {
+        info!("Reading Steam Deck back buttons from {} hidraw node(s)", paddle_nodes);
+        let _ = tx.send(Msg::Device {
+            path: PathBuf::from(DECK_PADDLES_PATH),
+            is_gamepad: false,
+            ranges: Vec::new(),
+            has_record_key: is_paddle_code(record_code),
+            has_replay_key: is_paddle_code(replay_code),
+        });
+    }
 
     thread::spawn(move || {
         let mut opened_paths = HashSet::new();
@@ -757,6 +875,8 @@ fn main() -> Result<()> {
             if is_replaying && is_deliberate && !is_record_btn && !is_replay_btn && cancel_on_input {
                 let lag_ms = std::time::SystemTime::now()
                     .duration_since(event.timestamp())
+                    .ok()
+                    .filter(|d| d.as_secs() < 3600) // synthetic events have no timestamp
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
                 warn!("Playback cancelled by physical input: {:?} (seen {} ms after the press)", kind, lag_ms);
@@ -780,7 +900,10 @@ fn main() -> Result<()> {
                 }
             }
 
-            if state == State::Recording && !is_record_btn && !is_replay_btn {
+            // Back buttons can trigger and cancel, but can't be recorded: the
+            // virtual gamepad the game reads has no such buttons to replay.
+            let from_paddles = device_path.as_os_str() == DECK_PADDLES_PATH;
+            if state == State::Recording && !is_record_btn && !is_replay_btn && !from_paddles {
                 if recorded_events.len() >= MAX_EVENTS {
                     state = State::Idle;
                     info!("Macro size limit reached. Stopped recording.");
@@ -1070,5 +1193,29 @@ mod tests {
         assert!(is_detectable_key(Key::KEY_F10.code()));
         assert!(is_detectable_key(Key::BTN_THUMBR.code()));
         assert!(is_detectable_key(Key::BTN_TR.code()));
+    }
+
+    #[test]
+    fn paddle_report_parsing() {
+        let mut report = [0u8; 64];
+        report[0] = 1;
+        report[2] = 9;
+        let mut last = [false; 4];
+        assert!(paddle_changes(&report, &mut last).is_empty());
+        report[10] |= 1; // R5
+        assert_eq!(paddle_changes(&report, &mut last), vec![(0x227, true)]);
+        assert!(paddle_changes(&report, &mut last).is_empty(), "no repeat while held");
+        report[13] |= 0b10; // L4 too
+        assert_eq!(paddle_changes(&report, &mut last), vec![(0x224, true)]);
+        report[10] = 0;
+        report[13] = 0;
+        let mut ch = paddle_changes(&report, &mut last);
+        ch.sort();
+        assert_eq!(ch, vec![(0x224, false), (0x227, false)]);
+        // other report types / malformed reports are ignored
+        report[2] = 1;
+        report[9] = 0x80;
+        assert!(paddle_changes(&report, &mut last).is_empty());
+        assert!(paddle_changes(&report[..32], &mut last).is_empty());
     }
 }

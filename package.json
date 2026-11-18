@@ -1,6 +1,6 @@
 {
   "name": "decky-macro-daemon-plugin",
-  "version": "1.3.3-analog",
+  "version": "1.4.0-analog",
   "description": "A template to quickly create decky plugins from scratch, based on TypeScript and webpack",
   "type": "module",
   "scripts": {
