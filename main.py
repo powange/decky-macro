@@ -3,6 +3,7 @@ import os
 import subprocess
 import json
 import threading
+import asyncio
 import traceback
 import decky_plugin
 
@@ -125,6 +126,41 @@ class Plugin:
             Plugin.process.terminate()
             Plugin.process.wait()
             Plugin.process = None
+
+    async def detect_trigger(self, which: str) -> dict:
+        """Waits for the next key press on any input device and saves it as the
+        record or replay trigger. Lets back buttons work once Steam Input maps
+        them to a keyboard key (the Deck does not expose them otherwise)."""
+        if which not in ("record", "replay"):
+            return {"error": "invalid trigger"}
+        if await self.get_daemon_state():
+            return {"error": "Stop the daemon first"}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.bin_path, "--detect-button", "10000",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except Exception as e:
+            decky_plugin.logger.error(f"Button detection failed: {e}\n{traceback.format_exc()}")
+            return {"error": str(e)}
+
+        line = out.decode("utf-8", errors="replace").strip().splitlines()[-1:] or [""]
+        parts = line[0].split(" ", 3)
+        if len(parts) < 3 or parts[0] != "DETECTED":
+            self.notifications.append({"message": "No button press detected", "error": True})
+            return {"error": "timeout"}
+
+        code, label = int(parts[1]), parts[2]
+        device = parts[3] if len(parts) > 3 else "?"
+        config = await self.get_config()
+        config[f"trigger_{which}_code"] = code
+        config[f"trigger_{which}_label"] = label
+        await self.save_config(config)
+        decky_plugin.logger.info(f"Detected {which} trigger: {label} ({code}) from {device}")
+        self.notifications.append({"message": f"{which.capitalize()} trigger set to {label}"})
+        return {"code": code, "label": label, "device": device}
 
     async def get_version(self) -> str:
         version = os.environ.get("DECKY_PLUGIN_VERSION")

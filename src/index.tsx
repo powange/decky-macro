@@ -27,6 +27,14 @@ const saveSlotsData = callable<[data: any], boolean>("save_slots_data");
 const getDaemonState = callable<[], boolean>("get_daemon_state");
 const setDaemonState = callable<[is_running: boolean], boolean>("set_daemon_state");
 const getVersion = callable<[], string>("get_version");
+const detectTrigger = callable<[which: string], { code?: number; label?: string; device?: string; error?: string }>("detect_trigger");
+
+// Adds the current code to the options when it was detected (e.g. a keyboard
+// key that Steam Input sends for a back button).
+const withCustom = (code: number, label?: string) =>
+  btnOptions.some((o) => o.data === code)
+    ? btnOptions
+    : [...btnOptions, { data: code, label: `Detected: ${label || `key ${code}`}` }];
 
 // Releases of this fork are published by .github/workflows/release.yml.
 const UPDATE_REPO = "powange/decky-macro";
@@ -204,6 +212,22 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
   const [recordCode, setRecordCode] = useState(initialConfig?.trigger_record_code ?? 317);
   const [replayCode, setReplayCode] = useState(initialConfig?.trigger_replay_code ?? 318);
   const [holdMs, setHoldMs] = useState(initialConfig?.hold_duration_ms ?? 500);
+  const [recordLabel, setRecordLabel] = useState<string | undefined>(initialConfig?.trigger_record_label);
+  const [replayLabel, setReplayLabel] = useState<string | undefined>(initialConfig?.trigger_replay_label);
+  const [detecting, setDetecting] = useState<string>("");
+
+  const detect = async (which: "record" | "replay") => {
+    setDetecting(which);
+    try {
+      const res = await detectTrigger(which);
+      if (res?.code !== undefined) {
+        if (which === "record") { setRecordCode(res.code); setRecordLabel(res.label); }
+        else { setReplayCode(res.code); setReplayLabel(res.label); }
+      }
+    } finally {
+      setDetecting("");
+    }
+  };
 
   return (
     <ConfirmModal
@@ -213,6 +237,8 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
           ...initialConfig,
           trigger_record_code: recordCode,
           trigger_replay_code: replayCode,
+          trigger_record_label: recordLabel,
+          trigger_replay_label: replayLabel,
           hold_duration_ms: holdMs,
         });
         closeModal();
@@ -221,22 +247,29 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
     >
       <div style={{ padding: "0 0 20px 0" }}>
         <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "12px", lineHeight: "1.3" }}>
-          These settings are read when the daemon starts. Stop the daemon before changing them. If a back button (L4/L5/R4/R5) is not seen by the daemon, an error toast appears when it starts.
+          These settings are read when the daemon starts. Stop the daemon before changing them.
+          The Deck does not expose its back buttons (L4/L5/R4/R5) to the daemon: map one to a keyboard key in the game's Steam Input layout (e.g. F10), then use Detect and press it. Detection works while a game has focus: press Detect, close the menu with the ··· button, then press your button within 10 seconds.
         </div>
 
         <div style={{ marginBottom: "5px" }}><b>Record Trigger:</b></div>
         <Dropdown
-          rgOptions={btnOptions}
+          rgOptions={withCustom(recordCode, recordLabel)}
           selectedOption={recordCode}
           onChange={(opt: any) => setRecordCode(opt.data)}
         />
+        <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("record")}>
+          {detecting === "record" ? "Press the button now (10 s)..." : "Detect record button"}
+        </ButtonItem>
 
         <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Replay Trigger:</b></div>
         <Dropdown
-          rgOptions={btnOptions}
+          rgOptions={withCustom(replayCode, replayLabel)}
           selectedOption={replayCode}
           onChange={(opt: any) => setReplayCode(opt.data)}
         />
+        <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("replay")}>
+          {detecting === "replay" ? "Press the button now (10 s)..." : "Detect replay button"}
+        </ButtonItem>
 
         <div style={{ marginTop: "12px" }}>
           <SliderField

@@ -70,7 +70,7 @@ fn key_label(code: u16) -> String {
         0x225 => "R4 (BTN_GRIPR)".into(),
         0x226 => "L5 (BTN_GRIPL2)".into(),
         0x227 => "R5 (BTN_GRIPR2)".into(),
-        c => format!("key {}", c),
+        c => format!("{:?}", Key::new(c)),
     }
 }
 
@@ -371,6 +371,46 @@ fn inject(
     }
 }
 
+/// `--detect-button <ms>`: prints the first key pressed on any input device
+/// ("DETECTED <code> <name> <device>") or "DETECT_TIMEOUT", then exits.
+/// A and B are ignored: they are used to navigate the Steam UI.
+fn detect_button(timeout_ms: u64) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<(u16, String)>();
+    if let Ok(dir) = fs::read_dir("/dev/input") {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if !path.to_string_lossy().contains("event") {
+                continue;
+            }
+            if let Ok(mut device) = Device::open(&path) {
+                let name = device.name().unwrap_or("?").to_string();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    while let Ok(events) = device.fetch_events() {
+                        for ev in events {
+                            if let InputEventKind::Key(k) = ev.kind() {
+                                if ev.value() == 1 && k != Key::BTN_SOUTH && k != Key::BTN_EAST {
+                                    let _ = tx.send((k.code(), name.clone()));
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok((code, device)) => {
+            println!("DETECTED {} {:?} {}", code, Key::new(code), device);
+            Ok(())
+        }
+        Err(_) => {
+            println!("DETECT_TIMEOUT");
+            std::process::exit(2);
+        }
+    }
+}
+
 enum Msg {
     /// A device was opened.
     Device {
@@ -395,6 +435,10 @@ fn main() -> Result<()> {
     info!("Starting Decky Macro v{} (analog support)...", env!("CARGO_PKG_VERSION"));
 
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--detect-button") {
+        let ms = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(10000);
+        return detect_button(ms);
+    }
     let mut config_path = String::new();
     let mut macro_file = String::new();
     let mut loops: i32 = 0;
