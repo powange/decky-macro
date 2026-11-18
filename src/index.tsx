@@ -39,19 +39,31 @@ const btnOptions = [
   { data: 311, label: "R1 (Right Bumper)" },
   { data: 314, label: "Select Button" },
   { data: 315, label: "Start Button" },
+  { data: 548, label: "L4 (Back Upper Left)" },
+  { data: 550, label: "L5 (Back Lower Left)" },
+  { data: 549, label: "R4 (Back Upper Right)" },
+  { data: 551, label: "R5 (Back Lower Right)" },
 ];
 
 const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal }: any) => {
   const [name, setName] = useState(initialData?.name || "");
   const [loops, setLoops] = useState(initialData?.loops || 0);
   const [cancel, setCancel] = useState(initialData?.cancel_on_input ?? true);
+  const [recordAnalog, setRecordAnalog] = useState(initialData?.record_analog ?? true);
+  const [cardinalOnly, setCardinalOnly] = useState(initialData?.cardinal_only ?? false);
 
   return (
     <ConfirmModal 
       onCancel={closeModal} 
       onOK={() => {
         const newData = { ...slotsData };
-        newData.slots[slotId] = { name: name || "Unnamed Slot", loops, cancel_on_input: cancel };
+        newData.slots[slotId] = {
+          name: name || "Unnamed Slot",
+          loops,
+          cancel_on_input: cancel,
+          record_analog: recordAnalog,
+          cardinal_only: cardinalOnly,
+        };
         newData.active_slot = slotId;
         updateSlots(newData);
         closeModal();
@@ -84,6 +96,19 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
           checked={cancel} 
           onChange={setCancel} 
         />
+        <ToggleField
+          label="Record analog sticks"
+          description="Record sticks and L2/R2 triggers (in 25/50/75/100% steps). Applies to the next recording."
+          checked={recordAnalog}
+          onChange={setRecordAnalog}
+        />
+        <ToggleField
+          label="Sticks: 4 directions only"
+          description="Keep only the dominant axis of each stick (up, down, left or right). Slightly-up-left is recorded as pure left."
+          checked={cardinalOnly}
+          disabled={!recordAnalog}
+          onChange={setCardinalOnly}
+        />
       </div>
     </ConfirmModal>
   );
@@ -110,7 +135,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
     >
       <div style={{ padding: "0 0 20px 0" }}>
         <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "12px", lineHeight: "1.3" }}>
-          These settings are read when the daemon starts. Stop the daemon before changing them.
+          These settings are read when the daemon starts. Stop the daemon before changing them. If a back button (L4/L5/R4/R5) is not seen by the daemon, an error toast appears when it starts.
         </div>
 
         <div style={{ marginBottom: "5px" }}><b>Record Trigger:</b></div>
@@ -190,7 +215,7 @@ function Content() {
     showModal(
       <SlotEditModal 
         slotId={newId} 
-        initialData={{ name: `Slot ${newId}`, loops: 0, cancel_on_input: true }}
+        initialData={{ name: `Slot ${newId}`, loops: 0, cancel_on_input: true, record_analog: true, cardinal_only: false }}
         slotsData={slotsData} 
         updateSlots={updateSlots} 
       />
@@ -266,7 +291,7 @@ function Content() {
 
       <PanelSection>
         <div style={{ padding: "0 10px 10px 10px", fontSize: "12px", color: "#ffcc00", fontWeight: "bold" }}>
-          Analog sticks and triggers (L2/R2) are recorded in 4 steps per direction (25/50/75/100%). Pushing a stick past halfway cancels playback.
+          Analog sticks and triggers (L2/R2) are recorded in 4 steps per direction (25/50/75/100%), configurable per slot. Pushing a stick past halfway cancels playback.
         </div>
         <PanelSectionRow>
           <ToggleField

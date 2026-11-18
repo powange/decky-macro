@@ -44,7 +44,7 @@ class Plugin:
                 json.dump({
                     "active_slot": "0",
                     "slots": {
-                        "0": { "name": "Default", "loops": 0, "cancel_on_input": True }
+                        "0": { "name": "Default", "loops": 0, "cancel_on_input": True, "record_analog": True, "cardinal_only": False }
                     }
                 }, f)
 
@@ -66,6 +66,8 @@ class Plugin:
             
             loops = str(slot_config.get("loops", 0))
             cancel = "true" if slot_config.get("cancel_on_input", True) else "false"
+            record_analog = "true" if slot_config.get("record_analog", True) else "false"
+            cardinal_only = "true" if slot_config.get("cardinal_only", False) else "false"
             macro_file = os.path.join(self.config_dir, f"macro_{active_slot}.json")
 
             decky_plugin.logger.info(f"Starting decky-macro-daemon daemon for slot {active_slot}...")
@@ -75,7 +77,9 @@ class Plugin:
                     "--config", self.config_path, 
                     "--macro-file", macro_file,
                     "--loops", loops,
-                    "--cancel-on-input", cancel
+                    "--cancel-on-input", cancel,
+                    "--record-analog", record_analog,
+                    "--cardinal-only", cardinal_only,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT
@@ -104,6 +108,10 @@ class Plugin:
                             notify("Playback Cancelled")
                         elif "Playback failed: no recorded inputs" in line_str:
                             notify("No macro recorded for this slot", error=True)
+                        elif "Trigger not available: record" in line_str:
+                            notify("Record button is not seen by the daemon - pick another one", error=True)
+                        elif "Trigger not available: replay" in line_str:
+                            notify("Replay button is not seen by the daemon - pick another one", error=True)
                         
             threading.Thread(target=log_output, args=(Plugin.process.stdout,), daemon=True).start()
             return True
