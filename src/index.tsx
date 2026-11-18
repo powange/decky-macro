@@ -13,7 +13,8 @@ import {
 import {
   callable,
   toaster,
-  definePlugin
+  definePlugin,
+  fetchNoCors
 } from "@decky/api"
 
 import { useState, useEffect, useMemo } from "react";
@@ -25,6 +26,91 @@ const getSlotsData = callable<[], any>("get_slots_data");
 const saveSlotsData = callable<[data: any], boolean>("save_slots_data");
 const getDaemonState = callable<[], boolean>("get_daemon_state");
 const setDaemonState = callable<[is_running: boolean], boolean>("set_daemon_state");
+const getVersion = callable<[], string>("get_version");
+
+// Releases of this fork are published by .github/workflows/release.yml.
+const UPDATE_REPO = "powange/decky-macro";
+const UPDATE_ASSET = "decky-macro.zip";
+// Must match "name" in plugin.json so Decky replaces the installed plugin.
+const PLUGIN_NAME = "Decky Macro";
+// Decky's PluginInstallType.UPDATE
+const INSTALL_TYPE_UPDATE = 2;
+
+function UpdateSection() {
+  const [current, setCurrent] = useState<string>("");
+  const [latest, setLatest] = useState<{ tag: string; url: string } | null>(null);
+  const [status, setStatus] = useState<string>("");
+  const [busy, setBusy] = useState<boolean>(false);
+
+  useEffect(() => {
+    getVersion().then(setCurrent).catch(() => setCurrent("?"));
+  }, []);
+
+  const check = async () => {
+    setBusy(true);
+    setStatus("Checking GitHub...");
+    setLatest(null);
+    try {
+      const res = await fetchNoCors(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const rel = await res.json();
+      const asset = (rel.assets || []).find((a: any) => a.name === UPDATE_ASSET);
+      if (!asset) throw new Error(`no ${UPDATE_ASSET} in the latest release`);
+      if (rel.tag_name === `v${current}`) {
+        setStatus(`Up to date (${rel.tag_name})`);
+      } else {
+        setLatest({ tag: rel.tag_name, url: asset.browser_download_url });
+        setStatus(`Update available: ${rel.tag_name}`);
+      }
+    } catch (e: any) {
+      setStatus(`Check failed: ${e?.message ?? e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const install = async () => {
+    if (!latest) return;
+    const backend = (window as any).DeckyBackend;
+    if (!backend?.call) {
+      setStatus("Decky install API not available - install from URL instead");
+      return;
+    }
+    // Opens Decky's own install confirmation, like the store does.
+    await backend.call(
+      "utilities/install_plugin",
+      latest.url,
+      PLUGIN_NAME,
+      latest.tag.replace(/^v/, ""),
+      "",
+      INSTALL_TYPE_UPDATE
+    );
+  };
+
+  return (
+    <PanelSection title="Updates">
+      <PanelSectionRow>
+        <div style={{ fontSize: 12, color: "#bbb" }}>
+          Installed: <b>{current || "..."}</b>
+          {status && <div>{status}</div>}
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        {latest ? (
+          <ButtonItem layout="below" onClick={install}>
+            Update to {latest.tag}
+          </ButtonItem>
+        ) : (
+          <ButtonItem layout="below" onClick={check} disabled={busy}>
+            Check for updates
+          </ButtonItem>
+        )}
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
 
 // Module-level flag read by the notification poller, which runs on the plugin
 // instance (outside <Content/>) and therefore has no access to the config state.
@@ -371,6 +457,7 @@ function Content() {
           />
         </PanelSectionRow>
       </PanelSection>
+      <UpdateSection />
     </>
   );
 }

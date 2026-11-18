@@ -126,6 +126,16 @@ class Plugin:
             Plugin.process.wait()
             Plugin.process = None
 
+    async def get_version(self) -> str:
+        version = os.environ.get("DECKY_PLUGIN_VERSION")
+        if version:
+            return version
+        try:
+            with open(os.path.join(decky_plugin.DECKY_PLUGIN_DIR, "package.json"), "r") as f:
+                return json.load(f).get("version", "?")
+        except Exception:
+            return "?"
+
     async def get_notifications(self) -> list:
         res = self.notifications.copy()
         self.notifications.clear()
