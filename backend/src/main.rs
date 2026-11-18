@@ -371,6 +371,16 @@ fn inject(
     }
 }
 
+/// Keys a trigger can be learnt from. Excludes A/B (used to navigate the Steam
+/// UI), mouse buttons (trackpad clicks) and touch/digitizer events such as
+/// BTN_TOUCH, which the touchscreen and trackpads send on every contact.
+fn is_detectable_key(code: u16) -> bool {
+    let a_b = code == Key::BTN_SOUTH.code() || code == Key::BTN_EAST.code();
+    let mouse = (0x110..=0x117).contains(&code);
+    let digitizer = (0x140..=0x14f).contains(&code);
+    !(a_b || mouse || digitizer)
+}
+
 /// `--detect-button <ms>`: prints the first key pressed on any input device
 /// ("DETECTED <code> <name> <device>") or "DETECT_TIMEOUT", then exits.
 /// A and B are ignored: they are used to navigate the Steam UI.
@@ -383,13 +393,20 @@ fn detect_button(timeout_ms: u64) -> Result<()> {
                 continue;
             }
             if let Ok(mut device) = Device::open(&path) {
+                // Touchscreens / touchpads (multi-touch) can't be triggers.
+                let is_touch = device
+                    .supported_absolute_axes()
+                    .map_or(false, |a| a.contains(evdev::AbsoluteAxisType::ABS_MT_POSITION_X));
+                if is_touch {
+                    continue;
+                }
                 let name = device.name().unwrap_or("?").to_string();
                 let tx = tx.clone();
                 thread::spawn(move || {
                     while let Ok(events) = device.fetch_events() {
                         for ev in events {
                             if let InputEventKind::Key(k) = ev.kind() {
-                                if ev.value() == 1 && k != Key::BTN_SOUTH && k != Key::BTN_EAST {
+                                if ev.value() == 1 && is_detectable_key(k.code()) {
                                     let _ = tx.send((k.code(), name.clone()));
                                 }
                             }
@@ -1041,5 +1058,17 @@ mod tests {
         cur.insert(ABS_Y, (-25000, STICK));
         let init = r.start(&cur);
         assert_eq!(init, vec![MacroEvent::new(Duration::ZERO, EV_ABS, ABS_Y, -24576)]);
+    }
+
+    #[test]
+    fn detection_ignores_touch_mouse_and_ui_buttons() {
+        assert!(!is_detectable_key(Key::BTN_TOUCH.code()));
+        assert!(!is_detectable_key(Key::BTN_TOOL_FINGER.code()));
+        assert!(!is_detectable_key(Key::BTN_LEFT.code()));
+        assert!(!is_detectable_key(Key::BTN_SOUTH.code()));
+        assert!(!is_detectable_key(Key::BTN_EAST.code()));
+        assert!(is_detectable_key(Key::KEY_F10.code()));
+        assert!(is_detectable_key(Key::BTN_THUMBR.code()));
+        assert!(is_detectable_key(Key::BTN_TR.code()));
     }
 }
