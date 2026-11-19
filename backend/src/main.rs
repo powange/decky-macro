@@ -358,15 +358,25 @@ fn inject(
             }
         }
     }
-    let dev = write_devices.get_mut(device_path).unwrap();
     let injection = InputEvent::new(evdev::EventType(t), c, v);
     let sync = InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0);
-    if dev.send_events(&[injection, sync]).is_ok() {
+    let mut sent = write_devices.get_mut(device_path).unwrap().send_events(&[injection, sync]).is_ok();
+    if !sent {
+        // The cached handle may point to a device that was removed and
+        // re-created at the same path (Steam recreates its virtual gamepad).
+        write_devices.remove(device_path);
+        if let Ok(mut d) = Device::open(device_path) {
+            sent = d.send_events(&[injection, sync]).is_ok();
+            write_devices.insert(device_path.clone(), d);
+        }
+    }
+    if sent {
         let e = ignore_injected.entry((device_path.clone(), t, c, v)).or_insert((0, Instant::now()));
         e.0 += 1;
         e.1 = Instant::now();
         true
     } else {
+        error!("Injection into {:?} failed", device_path);
         false
     }
 }
@@ -533,6 +543,7 @@ enum Msg {
     /// A device was opened.
     Device {
         path: PathBuf,
+        name: String,
         is_gamepad: bool,
         /// Ranges of its analog axes (gamepads only).
         ranges: Vec<(u16, AxisRange)>,
@@ -540,6 +551,8 @@ enum Msg {
         has_replay_key: bool,
     },
     Input(PathBuf, InputEvent),
+    /// A device disappeared (its reader stopped).
+    Removed(PathBuf),
 }
 
 #[derive(PartialEq)]
@@ -603,6 +616,7 @@ fn main() -> Result<()> {
         info!("Reading Steam Deck back buttons from {} hidraw node(s)", paddle_nodes);
         let _ = tx.send(Msg::Device {
             path: PathBuf::from(DECK_PADDLES_PATH),
+            name: "Steam Deck back buttons".to_string(),
             is_gamepad: false,
             ranges: Vec::new(),
             has_record_key: is_paddle_code(record_code),
@@ -610,16 +624,19 @@ fn main() -> Result<()> {
         });
     }
 
+    // Paths with a live reader. A reader removes its path when its device goes
+    // away, so a new device at the same path (Steam recreating its virtual
+    // gamepad when a game starts, after a reboot...) is picked up again.
+    let opened_paths: Arc<std::sync::Mutex<HashSet<PathBuf>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
     thread::spawn(move || {
-        let mut opened_paths = HashSet::new();
         loop {
             if let Ok(input_dir) = std::fs::read_dir("/dev/input") {
                 for entry in input_dir.flatten() {
                     let path = entry.path();
                     if path.to_string_lossy().contains("event") {
-                        if !opened_paths.contains(&path) {
+                        if !opened_paths.lock().unwrap().contains(&path) {
                             if let Ok(mut device) = Device::open(&path) {
-                                opened_paths.insert(path.clone());
+                                opened_paths.lock().unwrap().insert(path.clone());
 
                                 // Analog axes are only taken from gamepads. Motion
                                 // sensors and touchscreens also report ABS_X/ABS_Y
@@ -667,6 +684,7 @@ fn main() -> Result<()> {
                                 }
                                 let _ = tx_discovery.send(Msg::Device {
                                     path: path.clone(),
+                                    name: device.name().unwrap_or("?").to_string(),
                                     is_gamepad,
                                     ranges,
                                     has_record_key,
@@ -675,6 +693,7 @@ fn main() -> Result<()> {
 
                                 let tx_inner = tx_discovery.clone();
                                 let path_clone = path.clone();
+                                let opened = Arc::clone(&opened_paths);
                                 thread::spawn(move || {
                                     loop {
                                         match device.fetch_events() {
@@ -696,9 +715,14 @@ fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            Err(_) => break,
+                                            Err(e) => {
+                                                info!("Input device {:?} gone ({})", path_clone, e);
+                                                break;
+                                            }
                                         }
                                     }
+                                    opened.lock().unwrap().remove(&path_clone);
+                                    let _ = tx_inner.send(Msg::Removed(path_clone));
                                 });
                             }
                         }
@@ -725,6 +749,10 @@ fn main() -> Result<()> {
     let mut ignore_injected: EchoMap = HashMap::new();
     let mut last_echo_purge = Instant::now();
     let mut gamepads: HashSet<PathBuf> = HashSet::new();
+    // Most recently connected gamepad: playback target when no gamepad input
+    // was seen yet (e.g. replay started with a back button right after boot).
+    let mut last_gamepad: Option<PathBuf> = None;
+    let mut device_names: HashMap<PathBuf, String> = HashMap::new();
     let started_at = Instant::now();
     let mut trigger_check_done = false;
     let (mut seen_record_key, mut seen_replay_key) = (false, false);
@@ -788,18 +816,34 @@ fn main() -> Result<()> {
         }
 
         let input = match msg {
-            Some(Msg::Device { path, is_gamepad, ranges, has_record_key, has_replay_key }) => {
+            Some(Msg::Device { path, name, is_gamepad, ranges, has_record_key, has_replay_key }) => {
                 for (code, range) in ranges {
                     axis_ranges.insert((path.clone(), code), range);
                 }
+                device_names.insert(path.clone(), name);
+                // A device re-created at a known path: drop the stale write handle.
+                write_devices.remove(&path);
                 if is_gamepad {
-                    gamepads.insert(path);
+                    gamepads.insert(path.clone());
+                    last_gamepad = Some(path);
                 }
                 seen_record_key |= has_record_key;
                 seen_replay_key |= has_replay_key;
                 None
             }
             Some(Msg::Input(path, event)) => Some((path, event)),
+            Some(Msg::Removed(path)) => {
+                write_devices.remove(&path);
+                gamepads.remove(&path);
+                axis_ranges.retain(|(p, _), _| p != &path);
+                if last_gamepad.as_ref() == Some(&path) {
+                    last_gamepad = gamepads.iter().next().cloned();
+                }
+                if last_active_device.as_ref() == Some(&path) && !is_replaying {
+                    last_active_device = None;
+                }
+                None
+            }
             None => None,
         };
 
@@ -962,9 +1006,23 @@ fn main() -> Result<()> {
                 if record_held_since.is_none() {
                     replay_triggered_this_press = true;
                     if state == State::Idle {
+                        // Target: the gamepad used last, else the newest gamepad.
+                        let target_ok = last_active_device.as_ref().map_or(false, |d| gamepads.is_empty() || gamepads.contains(d));
+                        if !target_ok {
+                            last_active_device = last_gamepad.clone();
+                        }
                         if recorded_events.is_empty() {
                             error!("Playback failed: no recorded inputs for {:?}", active_macro_path);
+                        } else if last_active_device.is_none() {
+                            error!("Playback failed: no gamepad found to send the macro to");
                         } else {
+                            let target = last_active_device.clone().unwrap();
+                            info!(
+                                "Playback target: {:?} ({}), {} events",
+                                target,
+                                device_names.get(&target).map(String::as_str).unwrap_or("?"),
+                                recorded_events.len()
+                            );
                             is_replaying = true;
                             replay_index = 0;
                             current_iteration = 0;

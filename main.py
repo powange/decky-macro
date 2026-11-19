@@ -109,6 +109,8 @@ class Plugin:
                             notify("Playback Cancelled")
                         elif "Playback failed: no recorded inputs" in line_str:
                             notify("No macro recorded for this slot", error=True)
+                        elif "Playback failed: no gamepad found" in line_str:
+                            notify("No gamepad found to play the macro on", error=True)
                         elif "Trigger not available: record" in line_str:
                             notify("Record button is not seen by the daemon - pick another one", error=True)
                         elif "Trigger not available: replay" in line_str:
