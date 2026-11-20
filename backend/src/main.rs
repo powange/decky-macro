@@ -74,6 +74,23 @@ fn key_label(code: u16) -> String {
     }
 }
 
+/// System keys (volume, power, brightness...): never cancel a macro and are
+/// never recorded. On the Deck the volume buttons are a separate keyboard device.
+const SYSTEM_KEYS: [u16; 8] = [
+    113, // KEY_MUTE
+    114, // KEY_VOLUMEDOWN
+    115, // KEY_VOLUMEUP
+    116, // KEY_POWER
+    142, // KEY_SLEEP
+    143, // KEY_WAKEUP
+    224, // KEY_BRIGHTNESSDOWN
+    225, // KEY_BRIGHTNESSUP
+];
+
+fn is_system_key(code: u16) -> bool {
+    SYSTEM_KEYS.contains(&code)
+}
+
 fn stick_partner(code: u16) -> Option<(u16, u16)> {
     STICK_PAIRS.iter().copied().find(|(a, b)| *a == code || *b == code)
 }
@@ -916,7 +933,8 @@ fn main() -> Result<()> {
                 Some((_, range)) => range.deflection(value) > ANALOG_CANCEL_THRESHOLD,
                 None => value != 0,
             };
-            if is_replaying && is_deliberate && !is_record_btn && !is_replay_btn && cancel_on_input {
+            let is_system = matches!(kind, InputEventKind::Key(k) if is_system_key(k.code()));
+            if is_replaying && is_deliberate && !is_system && !is_record_btn && !is_replay_btn && cancel_on_input {
                 let lag_ms = std::time::SystemTime::now()
                     .duration_since(event.timestamp())
                     .ok()
@@ -947,7 +965,7 @@ fn main() -> Result<()> {
             // Back buttons can trigger and cancel, but can't be recorded: the
             // virtual gamepad the game reads has no such buttons to replay.
             let from_paddles = device_path.as_os_str() == DECK_PADDLES_PATH;
-            if state == State::Recording && !is_record_btn && !is_replay_btn && !from_paddles {
+            if state == State::Recording && !is_record_btn && !is_replay_btn && !from_paddles && !is_system {
                 if recorded_events.len() >= MAX_EVENTS {
                     state = State::Idle;
                     info!("Macro size limit reached. Stopped recording.");
@@ -1275,5 +1293,15 @@ mod tests {
         report[9] = 0x80;
         assert!(paddle_changes(&report, &mut last).is_empty());
         assert!(paddle_changes(&report[..32], &mut last).is_empty());
+    }
+
+    #[test]
+    fn volume_keys_are_system_keys() {
+        assert!(is_system_key(Key::KEY_VOLUMEUP.code()));
+        assert!(is_system_key(Key::KEY_VOLUMEDOWN.code()));
+        assert!(is_system_key(Key::KEY_MUTE.code()));
+        assert!(is_system_key(Key::KEY_POWER.code()));
+        assert!(!is_system_key(Key::BTN_SOUTH.code()));
+        assert!(!is_system_key(Key::KEY_F10.code()));
     }
 }
