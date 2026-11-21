@@ -19,6 +19,7 @@ import {
 
 import { useState, useEffect, useMemo } from "react";
 import { FaGamepad } from "react-icons/fa";
+import { t, tToast, setLanguage, formatDuration } from "./i18n";
 
 const getGlobalConfig = callable<[], any>("get_config");
 const saveGlobalConfig = callable<[config: any], boolean>("save_config");
@@ -28,13 +29,37 @@ const getDaemonState = callable<[], boolean>("get_daemon_state");
 const setDaemonState = callable<[is_running: boolean], boolean>("set_daemon_state");
 const getVersion = callable<[], string>("get_version");
 const detectTrigger = callable<[which: string], { code?: number; label?: string; device?: string; error?: string }>("detect_trigger");
+const getSlotStats = callable<[], Record<string, { events: number; duration_ms: number }>>("get_slot_stats");
+const getMacroPreview = callable<[slotId: string], { count: number; duration_ms: number; rows: { t: number; input: string; action: string }[] }>("get_macro_preview");
+const getDiagnostics = callable<[], { running: boolean; version: string; triggers: Record<string, any>; lines: string[] }>("get_diagnostics");
+const getNotifications = callable<[], { message: string; error?: boolean }[]>("get_notifications");
+
+// Back buttons: the game doesn't receive them (Steam's virtual pad has none).
+const BACK_BUTTONS = [548, 549, 550, 551];
+// Regular gamepad buttons: the game receives them too when used as triggers.
+const GAME_BUTTONS = [304, 305, 307, 308, 310, 311, 312, 313, 314, 315, 317, 318, 544, 545, 546, 547];
+
+const btnOptions = () => [
+  { data: 317, label: t("btnL3") },
+  { data: 318, label: t("btnR3") },
+  { data: 310, label: t("btnL1") },
+  { data: 311, label: t("btnR1") },
+  { data: 314, label: t("btnSelect") },
+  { data: 315, label: t("btnStart") },
+  { data: 548, label: t("btnL4") },
+  { data: 550, label: t("btnL5") },
+  { data: 549, label: t("btnR4") },
+  { data: 551, label: t("btnR5") },
+];
 
 // Adds the current code to the options when it was detected (e.g. a keyboard
-// key that Steam Input sends for a back button).
-const withCustom = (code: number, label?: string) =>
-  btnOptions.some((o) => o.data === code)
-    ? btnOptions
-    : [...btnOptions, { data: code, label: `Detected: ${label || `key ${code}`}` }];
+// key) and isn't one of the listed buttons.
+const withCustom = (code: number, label?: string) => {
+  const opts = btnOptions();
+  return opts.some((o) => o.data === code)
+    ? opts
+    : [...opts, { data: code, label: t("detected", { label: label || `key ${code}` }) }];
+};
 
 // Releases of this fork are published by .github/workflows/release.yml.
 const UPDATE_REPO = "powange/decky-macro";
@@ -56,6 +81,8 @@ const PLUGIN_NAME = "Decky Macro";
 // Decky's PluginInstallType.UPDATE
 const INSTALL_TYPE_UPDATE = 2;
 
+const small = { fontSize: "11px", color: "#bbb", lineHeight: "1.3" } as const;
+
 function UpdateSection() {
   const [current, setCurrent] = useState<string>("");
   const [latest, setLatest] = useState<{ tag: string; url: string } | null>(null);
@@ -68,7 +95,7 @@ function UpdateSection() {
 
   const check = async () => {
     setBusy(true);
-    setStatus("Checking GitHub...");
+    setStatus(t("checking"));
     setLatest(null);
     try {
       const res = await fetchNoCors(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
@@ -79,13 +106,13 @@ function UpdateSection() {
       const asset = (rel.assets || []).find((a: any) => a.name === UPDATE_ASSET);
       if (!asset) throw new Error(`no ${UPDATE_ASSET} in the latest release`);
       if (compareVersions(rel.tag_name, current) <= 0) {
-        setStatus(`Up to date (${current})`);
+        setStatus(t("upToDate", { v: current }));
       } else {
         setLatest({ tag: rel.tag_name, url: asset.browser_download_url });
-        setStatus(`Update available: ${rel.tag_name}`);
+        setStatus(t("updateAvailable", { v: rel.tag_name }));
       }
     } catch (e: any) {
-      setStatus(`Check failed: ${e?.message ?? e}`);
+      setStatus(t("checkFailed", { e: e?.message ?? String(e) }));
     } finally {
       setBusy(false);
     }
@@ -95,7 +122,7 @@ function UpdateSection() {
     if (!latest) return;
     const backend = (window as any).DeckyBackend;
     if (!backend?.call) {
-      setStatus(`Decky install API not available. Install from URL: https://github.com/${UPDATE_REPO}/releases/latest/download/${UPDATE_ASSET}`);
+      setStatus(t("noInstallApi", { url: `https://github.com/${UPDATE_REPO}/releases/latest/download/${UPDATE_ASSET}` }));
       return;
     }
     // Opens Decky's own install confirmation, like the store does.
@@ -110,21 +137,21 @@ function UpdateSection() {
   };
 
   return (
-    <PanelSection title="Updates">
+    <PanelSection title={t("updates")}>
       <PanelSectionRow>
         <div style={{ fontSize: 12, color: "#bbb" }}>
-          Installed: <b>{current || "..."}</b>
+          {t("installed")} <b>{current || "..."}</b>
           {status && <div>{status}</div>}
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
         {latest ? (
           <ButtonItem layout="below" onClick={install}>
-            Update to {latest.tag}
+            {t("updateTo", { v: latest.tag })}
           </ButtonItem>
         ) : (
           <ButtonItem layout="below" onClick={check} disabled={busy}>
-            Check for updates
+            {t("checkUpdates")}
           </ButtonItem>
         )}
       </PanelSectionRow>
@@ -138,34 +165,23 @@ function UpdateSection() {
 // it in sync with the `show_info_toasts` global config value.
 let showInfoToasts = true;
 
-const btnOptions = [
-  { data: 317, label: "L3 (Left Stick Click)" },
-  { data: 318, label: "R3 (Right Stick Click)" },
-  { data: 310, label: "L1 (Left Bumper)" },
-  { data: 311, label: "R1 (Right Bumper)" },
-  { data: 314, label: "Select Button" },
-  { data: 315, label: "Start Button" },
-  { data: 548, label: "L4 (Back Upper Left)" },
-  { data: 550, label: "L5 (Back Lower Left)" },
-  { data: 549, label: "R4 (Back Upper Right)" },
-  { data: 551, label: "R5 (Back Lower Right)" },
-];
-
 const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal }: any) => {
   const [name, setName] = useState(initialData?.name || "");
   const [loops, setLoops] = useState(initialData?.loops || 0);
+  const [speed, setSpeed] = useState<number>(initialData?.speed ?? 1);
   const [cancel, setCancel] = useState(initialData?.cancel_on_input ?? true);
   const [recordAnalog, setRecordAnalog] = useState(initialData?.record_analog ?? true);
   const [cardinalOnly, setCardinalOnly] = useState(initialData?.cardinal_only ?? false);
 
   return (
-    <ConfirmModal 
-      onCancel={closeModal} 
+    <ConfirmModal
+      onCancel={closeModal}
       onOK={() => {
         const newData = { ...slotsData, slots: { ...slotsData.slots } };
         newData.slots[slotId] = {
-          name: name || "Unnamed Slot",
+          name: name || t("unnamedSlot"),
           loops,
+          speed,
           cancel_on_input: cancel,
           record_analog: recordAnalog,
           cardinal_only: cardinalOnly,
@@ -174,43 +190,54 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
         updateSlots(newData);
         closeModal();
       }}
-      strTitle="Configure Slot"
+      strTitle={t("configureSlot")}
     >
       <div style={{ padding: "0 0 20px 0" }}>
-        <TextField 
-          label="Slot Name"
-          value={name} 
+        <TextField
+          label={t("slotName")}
+          value={name}
           onChange={(e: any) => {
             if (e.target.value.length <= 30) {
               setName(e.target.value);
             }
-          }} 
+          }}
         />
-        <SliderField 
-          label="Loop count" 
-          description="How many times the replay should run (0 is infinite)" 
-          value={loops} 
-          min={0} 
-          max={50} 
-          step={1} 
-          showValue={true} 
-          onChange={setLoops} 
+        <SliderField
+          label={t("loopCount")}
+          description={t("loopCountDesc")}
+          value={loops}
+          min={0}
+          max={50}
+          step={1}
+          showValue={true}
+          onChange={setLoops}
         />
-        <ToggleField 
-          label="Cancel on input" 
-          description="Cancel replay if a button is pressed"
-          checked={cancel} 
-          onChange={setCancel} 
+        <SliderField
+          label={t("speed")}
+          description={t("speedDesc")}
+          value={speed}
+          min={0.5}
+          max={2}
+          step={0.25}
+          showValue={true}
+          valueSuffix="×"
+          onChange={(v: number) => setSpeed(Math.round(v * 100) / 100)}
         />
         <ToggleField
-          label="Record analog sticks"
-          description="Record sticks and L2/R2 triggers (in 25/50/75/100% steps). Applies to the next recording."
+          label={t("cancelOnInput")}
+          description={t("cancelOnInputDesc")}
+          checked={cancel}
+          onChange={setCancel}
+        />
+        <ToggleField
+          label={t("recordAnalog")}
+          description={t("recordAnalogDesc")}
           checked={recordAnalog}
           onChange={setRecordAnalog}
         />
         <ToggleField
-          label="Sticks: 4 directions only"
-          description="Keep only the dominant axis of each stick (up, down, left or right). Slightly-up-left is recorded as pure left."
+          label={t("cardinal")}
+          description={t("cardinalDesc")}
           checked={cardinalOnly}
           disabled={!recordAnalog}
           onChange={setCardinalOnly}
@@ -236,6 +263,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
   const [pickerLabel, setPickerLabel] = useState<string | undefined>(initialConfig?.trigger_picker_label);
   const [pickerMode, setPickerMode] = useState<string>(initialConfig?.picker_trigger_mode ?? "hold");
   const [pickerCount, setPickerCount] = useState<number>(initialConfig?.picker_press_count ?? 3);
+  const [language, setLang] = useState<string>(initialConfig?.language ?? "auto");
   // Per-trigger timings; the old shared values are the starting point.
   const sharedHold = initialConfig?.hold_duration_ms ?? 500;
   const sharedWindow = initialConfig?.press_window_ms ?? 400;
@@ -247,9 +275,20 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
   const [pickerWindow, setPickerWindow] = useState<number>(initialConfig?.picker_press_window_ms ?? sharedWindow);
 
   const modeOptions = [
-    { data: "hold", label: "Long press" },
-    { data: "multi_press", label: "Repeated presses" },
+    { data: "hold", label: t("longPress") },
+    { data: "multi_press", label: t("repeatedPresses") },
   ];
+  const langOptions = [
+    { data: "auto", label: t("langAuto") },
+    { data: "en", label: "English" },
+    { data: "fr", label: "Français" },
+  ];
+
+  const gameButtonWarning = (code: number) =>
+    GAME_BUTTONS.includes(code) && !BACK_BUTTONS.includes(code) ? (
+      <div style={{ ...small, color: "#ffcc00", margin: "4px 0" }}>{t("gameButtonWarning")}</div>
+    ) : null;
+
   const triggerMode = (
     mode: string,
     setMode: (m: string) => void,
@@ -265,7 +304,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
       {mode === "multi_press" ? (
         <>
           <SliderField
-            label="Presses in a row"
+            label={t("pressesInRow")}
             value={count}
             min={2}
             max={10}
@@ -274,7 +313,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
             onChange={(v: number) => setCount(Math.round(v))}
           />
           <SliderField
-            label="Max time between presses"
+            label={t("maxBetween")}
             value={windowMs / 1000}
             min={0.2}
             max={1}
@@ -286,8 +325,8 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
         </>
       ) : (
         <SliderField
-          label="Hold time"
-          description="0 = trigger on press"
+          label={t("holdTime")}
+          description={t("holdTimeDesc")}
           value={holdMs / 1000}
           min={0}
           max={2}
@@ -313,6 +352,9 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
       setDetecting("");
     }
   };
+
+  const detectLabel = (which: string, idle: string) =>
+    detecting === which ? t("detectNow") : daemonRunning ? t("detectStopFirst") : idle;
 
   return (
     <ConfirmModal
@@ -340,92 +382,164 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
           record_press_window_ms: recordWindow,
           replay_press_window_ms: replayWindow,
           picker_press_window_ms: pickerWindow,
+          language,
         });
         closeModal();
       }}
-      strTitle="Daemon Settings"
+      strTitle={t("daemonSettings")}
     >
       <div style={{ padding: "0 0 20px 0" }}>
-        <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "12px", lineHeight: "1.3" }}>
-          Changes apply right away, or as soon as the current recording or playback ends.
-          Back buttons (L4/L5/R4/R5) are read directly from the Deck controller, so they can be picked from the list or detected. Detect: press it, then press the button within 10 seconds (touches, A and B are ignored).
-        </div>
+        <div style={{ ...small, marginBottom: "12px" }}>{t("settingsIntro")}</div>
 
-        <div style={{ marginBottom: "5px" }}><b>Record Trigger:</b></div>
+        <div style={{ marginBottom: "5px" }}><b>{t("language")}</b></div>
+        <Dropdown rgOptions={langOptions} selectedOption={language} onChange={(opt: any) => setLang(opt.data)} />
+
+        <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>{t("recordTrigger")}</b></div>
         <Dropdown
           rgOptions={withCustom(recordCode, recordLabel)}
           selectedOption={recordCode}
           onChange={(opt: any) => setRecordCode(opt.data)}
         />
+        {gameButtonWarning(recordCode)}
         <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("record")}>
-          {detecting === "record" ? "Press the button now (10 s)..." : daemonRunning ? "Detect: stop the daemon first" : "Detect record button"}
+          {detectLabel("record", t("detectRecord"))}
         </ButtonItem>
         {triggerMode(recordMode, setRecordMode, recordCount, setRecordCount, recordHold, setRecordHold, recordWindow, setRecordWindow)}
 
-        <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Replay Trigger:</b></div>
+        <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>{t("replayTrigger")}</b></div>
         <Dropdown
           rgOptions={withCustom(replayCode, replayLabel)}
           selectedOption={replayCode}
           onChange={(opt: any) => setReplayCode(opt.data)}
         />
+        {gameButtonWarning(replayCode)}
         <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("replay")}>
-          {detecting === "replay" ? "Press the button now (10 s)..." : daemonRunning ? "Detect: stop the daemon first" : "Detect replay button"}
+          {detectLabel("replay", t("detectReplay"))}
         </ButtonItem>
         {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount, replayHold, setReplayHold, replayWindow, setReplayWindow)}
 
-        <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Macro Picker Trigger:</b></div>
-        <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "5px" }}>
-          Shows the list of recorded macros in the middle of the screen: D-pad or stick to choose, A to play, B to close.
-        </div>
+        <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>{t("pickerTrigger")}</b></div>
+        <div style={{ ...small, marginBottom: "5px" }}>{t("pickerDesc")}</div>
         <Dropdown
-          rgOptions={[{ data: 0, label: "Disabled" }, ...withCustom(pickerCode || 317, pickerLabel).filter((o) => pickerCode !== 0 || o.data !== 0)]}
+          rgOptions={[{ data: 0, label: t("disabled") }, ...withCustom(pickerCode || 317, pickerLabel)]}
           selectedOption={pickerCode}
           onChange={(opt: any) => setPickerCode(opt.data)}
         />
         {pickerCode !== 0 && (
           <>
+            {gameButtonWarning(pickerCode)}
             <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("picker")}>
-              {detecting === "picker" ? "Press the button now (10 s)..." : daemonRunning ? "Detect: stop the daemon first" : "Detect picker button"}
+              {detectLabel("picker", t("detectPicker"))}
             </ButtonItem>
             {triggerMode(pickerMode, setPickerMode, pickerCount, setPickerCount, pickerHold, setPickerHold, pickerWindow, setPickerWindow)}
           </>
         )}
-
       </div>
     </ConfirmModal>
   );
 };
 
 const InfoModal = ({ closeModal }: any) => (
-  <ConfirmModal strTitle="How Decky Macro works" bAlertDialog={true} onOK={closeModal} onCancel={closeModal}>
+  <ConfirmModal strTitle={t("infoTitle")} bAlertDialog={true} onOK={closeModal} onCancel={closeModal}>
     <div style={{ fontSize: "13px", lineHeight: "1.5", color: "#ccc" }}>
-      <p>
-        Decky Macro runs a daemon that listens to hardware inputs (/dev/input/event*) to trigger and record
-        macros, and injects them back into the same gamepad. It doesn't know whether the inputs go to a game or to
-        the Steam client.
-      </p>
-      <p>
-        Analog sticks and triggers (L2/R2) are recorded in 4 steps per direction (25/50/75/100%), configurable per
-        slot. During playback, pushing a stick past halfway or pressing a button cancels the macro (volume and power
-        keys are ignored).
-      </p>
-      <p>
-        Back buttons (L4/L5/R4/R5) can be used as triggers. The optional macro picker trigger shows the list of
-        recorded macros in the middle of the screen: D-pad or left stick to choose, A to play, B to close.
-      </p>
+      <p>{t("info1")}</p>
+      <p>{t("info2")}</p>
+      <p>{t("info3")}</p>
     </div>
   </ConfirmModal>
 );
+
+const PREVIEW_ROWS = 300;
+
+const PreviewModal = ({ slotId, name, closeModal }: any) => {
+  const [data, setData] = useState<{ count: number; duration_ms: number; rows: { t: number; input: string; action: string }[] } | null>(null);
+  useEffect(() => {
+    getMacroPreview(slotId).then(setData).catch(() => setData({ count: 0, duration_ms: 0, rows: [] }));
+  }, [slotId]);
+  const cell = { padding: "2px 8px 2px 0", whiteSpace: "nowrap" } as const;
+  return (
+    <ConfirmModal strTitle={t("previewTitle", { name })} bAlertDialog={true} onOK={closeModal} onCancel={closeModal}>
+      {!data ? (
+        <div>{t("loading")}</div>
+      ) : data.count === 0 ? (
+        <div>{t("previewEmpty")}</div>
+      ) : (
+        <div>
+          <div style={{ marginBottom: 8 }}>
+            {t("previewSummary", { events: data.count, duration: formatDuration(data.duration_ms) })}
+          </div>
+          {data.count > PREVIEW_ROWS && <div style={small}>{t("previewTruncated", { n: PREVIEW_ROWS })}</div>}
+          <div style={{ maxHeight: "50vh", overflowY: "auto", fontSize: 12 }}>
+            <table style={{ borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ color: "#bbb", textAlign: "left" }}>
+                  <th style={cell}>{t("colTime")}</th>
+                  <th style={cell}>{t("colInput")}</th>
+                  <th style={cell}>{t("colAction")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.rows.map((r, i) => (
+                  <tr key={i}>
+                    <td style={cell}>{(r.t / 1000).toFixed(2)} s</td>
+                    <td style={cell}>{r.input}</td>
+                    <td style={cell}>{r.action}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </ConfirmModal>
+  );
+};
+
+const DiagnosticModal = ({ closeModal }: any) => {
+  const [diag, setDiag] = useState<{ running: boolean; version: string; triggers: Record<string, any>; lines: string[] } | null>(null);
+  const load = () => getDiagnostics().then(setDiag).catch(() => {});
+  useEffect(() => { load(); }, []);
+  return (
+    <ConfirmModal strTitle={t("diagTitle")} strOKButtonText={t("refresh")} onOK={load} onCancel={closeModal}>
+      {!diag ? (
+        <div>{t("loading")}</div>
+      ) : (
+        <div style={{ fontSize: 12, lineHeight: 1.4 }}>
+          <div><b>{t("diagVersion")}:</b> {diag.version}</div>
+          <div><b>{t("diagDaemon")}:</b> {diag.running ? t("running") : t("stopped")}</div>
+          <div>
+            <b>{t("diagTriggers")}:</b> {String(diag.triggers.record)} / {String(diag.triggers.replay)} /{" "}
+            {diag.triggers.picker ? String(diag.triggers.picker) : t("disabled")}
+          </div>
+          <div style={{ marginTop: 8 }}><b>{t("diagLog")}</b></div>
+          <div style={{ maxHeight: "45vh", overflowY: "auto", fontFamily: "monospace", fontSize: 10.5, whiteSpace: "pre-wrap", wordBreak: "break-all", background: "rgba(0,0,0,0.3)", padding: 6, borderRadius: 4 }}>
+            {diag.lines.length ? diag.lines.map((l) => l.replace(/^\[[^\]]*\]\s*/, "")).join("\n") : t("diagNoLog")}
+          </div>
+        </div>
+      )}
+    </ConfirmModal>
+  );
+};
 
 function Content() {
   const [globalConfig, setGlobalConfig] = useState<any>(null);
   const [slotsData, setSlotsData] = useState<any>(null);
   const [isDaemonRunning, setIsDaemonRunning] = useState<boolean>(false);
+  const [stats, setStats] = useState<Record<string, { events: number; duration_ms: number }>>({});
+
+  const refreshStats = () => getSlotStats().then(setStats).catch(() => {});
 
   useEffect(() => {
-    getGlobalConfig().then(setGlobalConfig);
+    getGlobalConfig().then((c) => {
+      setLanguage(c?.language);
+      setGlobalConfig(c);
+    });
     getSlotsData().then(setSlotsData);
     getDaemonState().then(setIsDaemonRunning);
+    refreshStats();
+    // Recordings change the stats while the panel is open.
+    const timer = setInterval(refreshStats, 3000);
+    return () => clearInterval(timer);
   }, []);
 
   // Keep the module-level toast flag (read by the notification poller) in sync.
@@ -434,6 +548,7 @@ function Content() {
   }, [globalConfig]);
 
   const setGlobal = async (newConfig: any) => {
+    setLanguage(newConfig?.language);
     setGlobalConfig(newConfig);
     await saveGlobalConfig(newConfig);
   };
@@ -441,6 +556,7 @@ function Content() {
   const updateSlots = async (newData: any) => {
     setSlotsData(newData);
     await saveSlotsData(newData);
+    refreshStats();
   };
 
   const toggleDaemon = async (state: boolean) => {
@@ -460,11 +576,11 @@ function Content() {
     const ids = Object.keys(slotsData.slots).map(Number);
     const newId = (ids.length > 0 ? Math.max(...ids) + 1 : 0).toString();
     showModal(
-      <SlotEditModal 
-        slotId={newId} 
-        initialData={{ name: `Slot ${newId}`, loops: 0, cancel_on_input: true, record_analog: true, cardinal_only: false }}
-        slotsData={slotsData} 
-        updateSlots={updateSlots} 
+      <SlotEditModal
+        slotId={newId}
+        initialData={{ name: t("newSlotName", { id: newId }), loops: 0, speed: 1, cancel_on_input: true, record_analog: true, cardinal_only: false }}
+        slotsData={slotsData}
+        updateSlots={updateSlots}
       />
     );
   };
@@ -473,11 +589,11 @@ function Content() {
     if (!slotsData) return;
     const activeId = slotsData.active_slot;
     showModal(
-      <SlotEditModal 
-        slotId={activeId} 
+      <SlotEditModal
+        slotId={activeId}
         initialData={slotsData.slots[activeId]}
-        slotsData={slotsData} 
-        updateSlots={updateSlots} 
+        slotsData={slotsData}
+        updateSlots={updateSlots}
       />
     );
   };
@@ -488,9 +604,9 @@ function Content() {
     if (activeId === "0") return; // Cannot delete default slot
 
     showModal(
-      <ConfirmModal 
-        strTitle="Delete Slot?" 
-        strDescription="Are you sure you want to delete this macro slot?"
+      <ConfirmModal
+        strTitle={t("deleteTitle")}
+        strDescription={t("deleteDesc")}
         onOK={() => {
           const newData = { ...slotsData, slots: { ...slotsData.slots } };
           delete newData.slots[activeId];
@@ -512,6 +628,12 @@ function Content() {
     );
   };
 
+  const slotSummary = (id: string) => {
+    const st = stats[id];
+    if (!st || st.events === 0) return t("slotEmpty");
+    return formatDuration(st.duration_ms);
+  };
+
   // Memoize options so Dropdown doesn't lose focus / reset scroll position
   const slotOptions = useMemo(() => {
     if (!slotsData) return [];
@@ -520,35 +642,39 @@ function Content() {
         data: id,
         label: (
           <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {s.name}
+            {s.name} <span style={{ color: "#999" }}>· {slotSummary(id)}</span>
           </div>
         )
       };
     });
-  }, [slotsData]);
+  }, [slotsData, stats, globalConfig]);
 
-  if (!globalConfig || !slotsData) return <div>Loading...</div>;
+  if (!globalConfig || !slotsData) return <div>{t("loading")}</div>;
 
   const activeSlotId = slotsData.active_slot;
+  const active = slotsData.slots[activeSlotId] || {};
+  const activeStats = stats[activeSlotId];
+  const loops = Number(active.loops || 0);
+  const speed = Number(active.speed ?? 1);
 
   return (
     <>
       <PanelSection>
         <PanelSectionRow>
           <ToggleField
-            label="Enable Decky Macro"
-            description="Stays on after a reboot if it was on"
+            label={t("enable")}
+            description={t("enableDesc")}
             checked={isDaemonRunning}
             onChange={(val: boolean) => toggleDaemon(val)}
           />
         </PanelSectionRow>
         <PanelSectionRow>
           <div style={{ padding: 10, backgroundColor: "rgba(0,0,0,0.3)", borderRadius: 4, fontSize: 13, lineHeight: "1.5" }}>
-            <b>Status: </b> 
+            <b>{t("status")} </b>
             {isDaemonRunning ? (
-              <span style={{ color: "#00ffcc" }}>Running</span>
+              <span style={{ color: "#00ffcc" }}>{t("running")}</span>
             ) : (
-              <span style={{ color: "#ffcc00" }}>Stopped</span>
+              <span style={{ color: "#ffcc00" }}>{t("stopped")}</span>
             )}
           </div>
         </PanelSectionRow>
@@ -556,16 +682,13 @@ function Content() {
 
       <PanelSection>
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            onClick={openSettings}
-          >
-            Settings
+          <ButtonItem layout="below" onClick={openSettings}>
+            {t("settings")}
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
 
-      <PanelSection title="Active Macro Slot">
+      <PanelSection title={t("activeSlot")}>
         <PanelSectionRow>
           <Dropdown
             rgOptions={slotOptions}
@@ -575,31 +698,48 @@ function Content() {
             }}
           />
         </PanelSectionRow>
+        <PanelSectionRow>
+          <div style={{ ...small, padding: "4px 2px" }}>
+            {!activeStats || activeStats.events === 0
+              ? t("slotEmpty")
+              : t("slotInfo", { events: activeStats.events, duration: formatDuration(activeStats.duration_ms) })}
+            {" · "}
+            {loops === 0 ? t("loopsInfinite") : t("loopsN", { n: loops })}
+            {speed !== 1 && <> · {t("speedInfo", { speed })}</>}
+          </div>
+        </PanelSectionRow>
 
         <PanelSectionRow>
           <div style={{ display: "flex", flexDirection: "column", gap: "5px", marginTop: "10px" }}>
             <ButtonItem layout="below" onClick={handleEdit}>
-              Edit Selected Slot
+              {t("editSlot")}
             </ButtonItem>
-            <ButtonItem 
-              layout="below" 
+            <ButtonItem
+              layout="below"
+              onClick={() => showModal(<PreviewModal slotId={activeSlotId} name={active.name || activeSlotId} />)}
+              disabled={!activeStats || activeStats.events === 0}
+            >
+              {t("preview")}
+            </ButtonItem>
+            <ButtonItem
+              layout="below"
               onClick={handleDelete}
               disabled={activeSlotId === "0"}
             >
-              Delete Selected Slot
+              {t("deleteSlot")}
             </ButtonItem>
             <ButtonItem layout="below" onClick={handleNew}>
-              New Slot
+              {t("newSlot")}
             </ButtonItem>
           </div>
         </PanelSectionRow>
       </PanelSection>
 
-      <PanelSection title="Notifications">
+      <PanelSection title={t("notifications")}>
         <PanelSectionRow>
           <ToggleField
-            label="Show info toasts"
-            description="Show status toasts (recording started/saved, playback started/finished). Error toasts are always shown."
+            label={t("showToasts")}
+            description={t("showToastsDesc")}
             checked={globalConfig.show_info_toasts ?? true}
             onChange={(val: boolean) => {
               setTimeout(() => setGlobal({ ...globalConfig, show_info_toasts: val }), 0);
@@ -610,7 +750,12 @@ function Content() {
       <PanelSection>
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={() => showModal(<InfoModal />)}>
-            ⓘ How it works
+            {t("howItWorks")}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => showModal(<DiagnosticModal />)}>
+            {t("diagnostic")}
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
@@ -619,10 +764,10 @@ function Content() {
   );
 }
 
-
-const getNotifications = callable<[], { message: string; error?: boolean }[]>("get_notifications");
-
 export default definePlugin(() => {
+  // Toasts can arrive before the panel is opened: pick the language now.
+  getGlobalConfig().then((c) => setLanguage(c?.language)).catch(() => setLanguage("auto"));
+
   const interval = setInterval(async () => {
     try {
       const res = await getNotifications();
@@ -632,8 +777,8 @@ export default definePlugin(() => {
           // Error toasts are always shown; info toasts honour the setting.
           if (!isError && !showInfoToasts) continue;
           toaster.toast({
-            title: isError ? "Decky Macro (error)" : "Decky Macro",
-            body: n?.message ?? String(n),
+            title: isError ? t("toastErrorTitle") : t("toastTitle"),
+            body: tToast(n?.message ?? String(n)),
             duration: isError ? 4000 : 1500,
             sound: 0,
           });

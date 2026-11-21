@@ -46,6 +46,9 @@ const LEVEL_HYSTERESIS: f32 = 0.2;
 // During playback, a physical analog deflection above this fraction cancels
 // the macro (when "cancel on input" is enabled). Small bumps are ignored.
 const ANALOG_CANCEL_THRESHOLD: f32 = 0.5;
+// During playback, a physical stick pushed past this fraction takes over that
+// axis: the macro value is no longer re-asserted while the player holds it.
+const PLAYER_TAKEOVER: f32 = 0.25;
 
 // Left / right stick axis pairs, used by the "4 directions" recording mode.
 const STICK_PAIRS: [(u16, u16); 2] = [(ABS_X, ABS_Y), (ABS_RX, ABS_RY)];
@@ -382,6 +385,8 @@ struct SlotSettings {
     record_analog: bool,
     #[serde(default)]
     cardinal_only: bool,
+    #[serde(default = "default_speed")]
+    speed: f32,
 }
 
 fn load_slot_settings(path: &str) -> Option<SlotSettings> {
@@ -632,6 +637,41 @@ fn nav_changes(report: &[u8], last: &mut [bool; 4]) -> Vec<(u16, bool)> {
     out
 }
 
+/// Left stick Y of a Deck report turned into D-pad up/down presses for the
+/// picker (one press per push, with a latch). Raw Y is positive up
+/// (bytes 50-51, little-endian i16; hid-steam negates it for evdev).
+fn stick_nav(report: &[u8], latch: &mut i32) -> Vec<(u16, bool)> {
+    if report.len() != 64 || report[0] != 1 || report[1] != 0 || report[2] != 9 {
+        return Vec::new();
+    }
+    let y = i16::from_le_bytes([report[50], report[51]]) as f32 / 32767.0;
+    let target = if y > 0.6 {
+        1
+    } else if y < -0.6 {
+        -1
+    } else if y.abs() < 0.3 {
+        0
+    } else {
+        *latch
+    };
+    if target == *latch {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    match *latch {
+        1 => out.push((0x220, false)),
+        -1 => out.push((0x221, false)),
+        _ => {}
+    }
+    match target {
+        1 => out.push((0x220, true)),
+        -1 => out.push((0x221, true)),
+        _ => {}
+    }
+    *latch = target;
+    out
+}
+
 fn find_deck_hidraw() -> Vec<PathBuf> {
     let mut found = Vec::new();
     if let Ok(dir) = fs::read_dir("/sys/class/hidraw") {
@@ -672,6 +712,7 @@ where
             let mut buf = [0u8; 64];
             let mut last = [false; 4];
             let mut last_nav = [false; 4];
+            let mut stick_latch = 0;
             loop {
                 match file.read(&mut buf) {
                     Ok(n) if n > 0 => {
@@ -680,7 +721,8 @@ where
                         }
                         // Always track nav state (no spurious press when the
                         // picker opens with a button held), only send when open.
-                        let nav = nav_changes(&buf[..n], &mut last_nav);
+                        let mut nav = nav_changes(&buf[..n], &mut last_nav);
+                        nav.extend(stick_nav(&buf[..n], &mut stick_latch));
                         if picker_open.load(Ordering::Relaxed) {
                             for (code, pressed) in nav {
                                 cb(code, pressed);
@@ -708,6 +750,22 @@ struct PickerItem {
     loops: i32,
     #[serde(default = "default_true")]
     cancel_on_input: bool,
+    #[serde(default = "default_speed")]
+    speed: f32,
+}
+
+fn default_speed() -> f32 {
+    1.0
+}
+
+/// Playback speed factor, kept in a sane range.
+fn clamp_speed(speed: f32) -> f32 {
+    if speed.is_finite() { speed.clamp(0.25, 4.0) } else { 1.0 }
+}
+
+/// When an event recorded at `delay_ms` plays at `speed`.
+fn scaled_delay(delay_ms: u64, speed: f32) -> Duration {
+    Duration::from_secs_f64(delay_ms as f64 / 1000.0 / clamp_speed(speed) as f64)
 }
 
 fn default_true() -> bool {
@@ -927,6 +985,7 @@ fn main() -> Result<()> {
     let mut slot_file = String::new();
     let mut record_analog = true;
     let mut cardinal_only = false;
+    let mut speed: f32 = 1.0;
 
     let mut i = 1;
     while i < args.len() {
@@ -949,6 +1008,7 @@ fn main() -> Result<()> {
         cancel_on_input = slot.cancel_on_input;
         record_analog = slot.record_analog;
         cardinal_only = slot.cardinal_only;
+        speed = clamp_speed(slot.speed);
     }
 
     let mut config = load_or_create_config(&config_path);
@@ -1122,7 +1182,7 @@ fn main() -> Result<()> {
     let mut picker_multi_fire = false;
     let mut picker: Option<Picker> = None;
     // Slot macro/settings to restore once a macro started from the picker stops.
-    let mut picker_restore: Option<(Vec<MacroEvent>, i32, bool)> = None;
+    let mut picker_restore: Option<(Vec<MacroEvent>, i32, bool, f32)> = None;
     let mut force_replay = false;
     // Picker navigation read from the Deck's raw HID reports (more reliable than
     // the virtual gamepad's D-pad); used instead of the grabbed device when available.
@@ -1184,6 +1244,7 @@ fn main() -> Result<()> {
                 cancel_on_input = slot.cancel_on_input;
                 record_analog = slot.record_analog;
                 cardinal_only = slot.cardinal_only;
+                speed = clamp_speed(slot.speed);
                 analog_recorder = AnalogRecorder::new(cardinal_only);
             }
             record_held_since = None;
@@ -1194,8 +1255,8 @@ fn main() -> Result<()> {
             picker_presses = PressCounter::default();
             devices_changed = true; // re-check trigger availability
             info!(
-                "Reloaded: slot {:?} ({} events), loops {}, cancel {}, analog {}, 4 directions {}",
-                active_macro_path, recorded_events.len(), loops, cancel_on_input, record_analog, cardinal_only
+                "Reloaded: slot {:?} ({} events), loops {}, cancel {}, analog {}, 4 directions {}, speed {}x",
+                active_macro_path, recorded_events.len(), loops, cancel_on_input, record_analog, cardinal_only, speed
             );
         }
 
@@ -1224,7 +1285,7 @@ fn main() -> Result<()> {
 
         let timeout = if is_replaying && replay_index < recorded_events.len() {
             let next_event = &recorded_events[replay_index];
-            let target_time = replay_start_time + Duration::from_millis(next_event.delay_ms);
+            let target_time = replay_start_time + scaled_delay(next_event.delay_ms, speed);
             let now = Instant::now();
             if target_time > now { Some(target_time - now) } else { Some(Duration::from_secs(0)) }
         } else {
@@ -1248,12 +1309,11 @@ fn main() -> Result<()> {
                             info!("Picker input: type={} code={} value={}", ev.event_type().0, ev.code(), ev.value());
                         }
                         if let Some(a) = p.action_for(&ev, config.trigger_picker_code) {
-                            // With the Deck's raw reports available, D-pad/A/B come from
-                            // there; only the stick and the picker button are taken
-                            // from the grabbed device.
-                            let from_stick = ev.event_type() == evdev::EventType::ABSOLUTE && ev.code() == ABS_Y;
+                            // With the Deck's raw reports available, D-pad, left stick,
+                            // A and B come from there; only the picker button is taken
+                            // from the grabbed device (no double steps).
                             let is_picker_key = a == PickerAction::Close && ev.code() == config.trigger_picker_code;
-                            if paddle_nodes == 0 || from_stick || is_picker_key {
+                            if paddle_nodes == 0 || is_picker_key {
                                 actions.push(a);
                             }
                         }
@@ -1284,9 +1344,10 @@ fn main() -> Result<()> {
                     let events = load_macro(Path::new(&item.path));
                     info!("Picker: playing \"{}\" ({} events)", item.name, events.len());
                     let saved = std::mem::replace(&mut recorded_events, events);
-                    picker_restore = Some((saved, loops, cancel_on_input));
+                    picker_restore = Some((saved, loops, cancel_on_input, speed));
                     loops = item.loops;
                     cancel_on_input = item.cancel_on_input;
+                    speed = clamp_speed(item.speed);
                     last_active_device = Some(target);
                     force_replay = true;
                 }
@@ -1497,7 +1558,8 @@ fn main() -> Result<()> {
             // gamepad, which instantly undoes an injected stick value. While the
             // macro holds an axis, put the macro value back whenever something
             // else overwrites it (unless it was a deliberate push, handled above).
-            if is_replaying && !is_deliberate && last_active_device.as_ref() == Some(&device_path) {
+            let player_holds_axis = analog.map_or(false, |(_, r)| r.deflection(value) >= PLAYER_TAKEOVER);
+            if is_replaying && !is_deliberate && !player_holds_axis && last_active_device.as_ref() == Some(&device_path) {
                 if let Some((code, _)) = analog {
                     if let Some(&held) = injected_state.get(&(EV_ABS, code)) {
                         if value != held {
@@ -1546,10 +1608,11 @@ fn main() -> Result<()> {
         if record_fire && picker.is_none() {
             if state == State::Idle {
                 state = State::Recording;
-                if let Some((ev, l, c)) = picker_restore.take() {
+                if let Some((ev, l, c, sp)) = picker_restore.take() {
                     recorded_events = ev;
                     loops = l;
                     cancel_on_input = c;
+                    speed = sp;
                 }
                 recorded_events.clear();
                 record_start_time = Instant::now();
@@ -1680,7 +1743,7 @@ fn main() -> Result<()> {
 
         if is_replaying && replay_index < recorded_events.len() {
             let next_event = &recorded_events[replay_index];
-            if Instant::now() >= replay_start_time + Duration::from_millis(next_event.delay_ms) {
+            if Instant::now() >= replay_start_time + scaled_delay(next_event.delay_ms, speed) {
                 if let Some(device_path) = last_active_device.clone() {
                     let (t, c, v) = (next_event.event_type, next_event.code, next_event.value);
                     if inject(&mut write_devices, &mut ignore_injected, &device_path, t, c, v) {
@@ -1738,10 +1801,11 @@ fn main() -> Result<()> {
 
         // Back to the selected slot once a macro started from the picker ends.
         if !is_replaying && !pending_recenter {
-            if let Some((ev, l, c)) = picker_restore.take() {
+            if let Some((ev, l, c, sp)) = picker_restore.take() {
                 recorded_events = ev;
                 loops = l;
                 cancel_on_input = c;
+                speed = sp;
             }
         }
 
@@ -2051,5 +2115,37 @@ mod tests {
         assert_eq!(s.loops, 3);
         assert!(s.cancel_on_input && s.record_analog && s.cardinal_only);
         assert!(load_slot_settings("").is_none());
+    }
+
+    #[test]
+    fn stick_nav_latches() {
+        let mut r = [0u8; 64];
+        r[0] = 1;
+        r[2] = 9;
+        let set_y = |r: &mut [u8; 64], v: i16| {
+            let b = v.to_le_bytes();
+            r[50] = b[0];
+            r[51] = b[1];
+        };
+        let mut latch = 0;
+        set_y(&mut r, 30000); // pushed up
+        assert_eq!(stick_nav(&r, &mut latch), vec![(0x220, true)]);
+        set_y(&mut r, 25000); // still up: no repeat
+        assert!(stick_nav(&r, &mut latch).is_empty());
+        set_y(&mut r, 15000); // between 30% and 60%: keeps state
+        assert!(stick_nav(&r, &mut latch).is_empty());
+        set_y(&mut r, 0); // released
+        assert_eq!(stick_nav(&r, &mut latch), vec![(0x220, false)]);
+        set_y(&mut r, -32000); // down
+        assert_eq!(stick_nav(&r, &mut latch), vec![(0x221, true)]);
+    }
+
+    #[test]
+    fn speed_scales_delays() {
+        assert_eq!(scaled_delay(1000, 1.0), Duration::from_millis(1000));
+        assert_eq!(scaled_delay(1000, 2.0), Duration::from_millis(500));
+        assert_eq!(scaled_delay(1000, 0.5), Duration::from_millis(2000));
+        assert_eq!(scaled_delay(1000, f32::NAN), Duration::from_millis(1000));
+        assert_eq!(scaled_delay(1000, 100.0), Duration::from_millis(250), "clamped to 4x");
     }
 }

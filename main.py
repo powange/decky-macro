@@ -9,7 +9,35 @@ import pwd
 import shutil
 import time
 import signal
+from collections import deque
 import decky_plugin
+
+# Readable names for the macro preview (Steam virtual gamepad codes).
+KEY_NAMES = {
+    304: "A", 305: "B", 307: "X", 308: "Y", 310: "L1", 311: "R1", 312: "L2", 313: "R2",
+    314: "View", 315: "Menu", 316: "Steam", 317: "L3", 318: "R3",
+    544: "D-pad up", 545: "D-pad down", 546: "D-pad left", 547: "D-pad right",
+}
+AXIS_NAMES = {0: "Left stick X", 1: "Left stick Y", 2: "L2", 3: "Right stick X", 4: "Right stick Y",
+              5: "R2", 16: "D-pad X", 17: "D-pad Y", 20: "R2", 21: "L2"}
+
+
+def _read_macro(path):
+    """Events of a macro file as (delay_ms, type, code, value) tuples."""
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+    except Exception:
+        return []
+    events = []
+    for item in raw if isinstance(raw, list) else []:
+        parts = str(item).split(":")
+        if len(parts) == 4:
+            try:
+                events.append(tuple(int(x) for x in parts))
+            except ValueError:
+                pass
+    return events
 
 # Environment variables set by Decky's bundled (PyInstaller) python that would
 # break the system python3 used for the picker overlay.
@@ -32,10 +60,13 @@ DEFAULT_CONFIG = {
     "picker_trigger_mode": "hold",
     "picker_press_count": 3,
     "daemon_enabled": False,
+    "language": "auto",
     "show_info_toasts": True,
 }
 
 class Plugin:
+    # Last daemon log lines, for the Diagnostic view.
+    log_lines = deque(maxlen=200)
     process = None
 
     def __init__(self):
@@ -84,6 +115,7 @@ class Plugin:
                 "cancel_on_input": bool(sc.get("cancel_on_input", True)),
                 "record_analog": bool(sc.get("record_analog", True)),
                 "cardinal_only": bool(sc.get("cardinal_only", False)),
+                "speed": float(sc.get("speed", 1.0)),
             }, f)
         os.replace(tmp, path)
         return path
@@ -153,6 +185,8 @@ class Plugin:
 
             def handle_line(line):
                         line_str = line.decode('utf-8', errors='replace').strip()
+                        if not line_str.startswith("PICKER_"):
+                            Plugin.log_lines.append(line_str)
 
                         # Picker menu messages go to the overlay, not the log.
                         if line_str.startswith("PICKER_SHOW "):
@@ -216,6 +250,7 @@ class Plugin:
                 "path": os.path.join(self.config_dir, f"macro_{sid}.json"),
                 "loops": int(sc.get("loops", 0)),
                 "cancel_on_input": bool(sc.get("cancel_on_input", True)),
+                "speed": float(sc.get("speed", 1.0)),
             })
         with open(path, "w") as f:
             json.dump(items, f)
@@ -346,6 +381,52 @@ class Plugin:
         decky_plugin.logger.info(f"Detected {which} trigger: {label} ({code}) from {device}")
         self.notifications.append({"message": f"{which.capitalize()} trigger set to {label}"})
         return {"code": code, "label": label, "device": device}
+
+    # ------------------------------------------------------------------ #
+    # Slot info, macro preview, diagnostics
+    # ------------------------------------------------------------------ #
+
+    async def get_slot_stats(self) -> dict:
+        """Number of events and duration of each slot's macro."""
+        stats = {}
+        for sid in self._get_data().get("slots", {}):
+            events = _read_macro(os.path.join(self.config_dir, f"macro_{sid}.json"))
+            stats[sid] = {"events": len(events), "duration_ms": events[-1][0] if events else 0}
+        return stats
+
+    async def get_macro_preview(self, slot_id: str) -> dict:
+        """A readable timeline of a slot's macro (first 300 events)."""
+        events = _read_macro(os.path.join(self.config_dir, f"macro_{slot_id}.json"))
+        rows = []
+        for delay, etype, code, value in events[:300]:
+            if etype == 1:
+                name = KEY_NAMES.get(code, f"key {code}")
+                what = "press" if value == 1 else "release" if value == 0 else f"repeat"
+            elif etype == 3:
+                name = AXIS_NAMES.get(code, f"axis {code}")
+                if code == 16:
+                    what = {-1: "left", 0: "center", 1: "right"}.get(value, str(value))
+                elif code == 17:
+                    what = {-1: "up", 0: "center", 1: "down"}.get(value, str(value))
+                elif code in (2, 5, 20, 21):
+                    what = f"{round(value * 100 / 255)}%"
+                else:
+                    what = f"{round(value * 100 / 32767)}%" if value else "center"
+            else:
+                continue
+            rows.append({"t": delay, "input": name, "action": what})
+        return {"count": len(events), "duration_ms": events[-1][0] if events else 0, "rows": rows}
+
+    async def get_diagnostics(self) -> dict:
+        running = await self.get_daemon_state()
+        config = await self.get_config()
+        return {
+            "running": running,
+            "version": await self.get_version(),
+            "triggers": {k: config.get(f"trigger_{k}_label") or config.get(f"trigger_{k}_code")
+                         for k in ("record", "replay", "picker")},
+            "lines": list(Plugin.log_lines)[-40:],
+        }
 
     async def get_version(self) -> str:
         version = os.environ.get("DECKY_PLUGIN_VERSION")
