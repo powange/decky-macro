@@ -549,6 +549,35 @@ fn paddle_changes(report: &[u8], last: &mut [bool; 4]) -> Vec<(u16, bool)> {
     out
 }
 
+// D-pad up/down, A and B in the same report (hid-steam.c table). Only sent
+// while the macro picker is open, to navigate it.
+const DECK_NAV: [(u16, usize, u8); 4] = [
+    (0x220, 9, 0), // BTN_DPAD_UP
+    (0x221, 9, 3), // BTN_DPAD_DOWN
+    (0x130, 8, 7), // BTN_SOUTH (A)
+    (0x131, 8, 5), // BTN_EAST (B)
+];
+
+fn is_nav_code(code: u16) -> bool {
+    DECK_NAV.iter().any(|(c, _, _)| *c == code)
+}
+
+/// Like paddle_changes, for the picker navigation buttons.
+fn nav_changes(report: &[u8], last: &mut [bool; 4]) -> Vec<(u16, bool)> {
+    let mut out = Vec::new();
+    if report.len() != 64 || report[0] != 1 || report[1] != 0 || report[2] != 9 {
+        return out;
+    }
+    for (i, (code, byte, bit)) in DECK_NAV.iter().enumerate() {
+        let pressed = report[*byte] & (1 << bit) != 0;
+        if pressed != last[i] {
+            last[i] = pressed;
+            out.push((*code, pressed));
+        }
+    }
+    out
+}
+
 fn find_deck_hidraw() -> Vec<PathBuf> {
     let mut found = Vec::new();
     if let Ok(dir) = fs::read_dir("/sys/class/hidraw") {
@@ -568,7 +597,7 @@ fn find_deck_hidraw() -> Vec<PathBuf> {
 
 /// Starts one reader thread per Deck hidraw node; `on_change(code, pressed)`
 /// is called on every back-button press/release. Returns the number of nodes.
-fn spawn_paddle_readers<F>(on_change: F) -> usize
+fn spawn_paddle_readers<F>(on_change: F, picker_open: Arc<AtomicBool>) -> usize
 where
     F: Fn(u16, bool) + Send + Clone + 'static,
 {
@@ -576,6 +605,7 @@ where
     for node in &nodes {
         let node = node.clone();
         let cb = on_change.clone();
+        let picker_open = Arc::clone(&picker_open);
         thread::spawn(move || {
             use std::io::Read;
             let mut file = match fs::File::open(&node) {
@@ -587,11 +617,20 @@ where
             };
             let mut buf = [0u8; 64];
             let mut last = [false; 4];
+            let mut last_nav = [false; 4];
             loop {
                 match file.read(&mut buf) {
                     Ok(n) if n > 0 => {
                         for (code, pressed) in paddle_changes(&buf[..n], &mut last) {
                             cb(code, pressed);
+                        }
+                        // Always track nav state (no spurious press when the
+                        // picker opens with a button held), only send when open.
+                        let nav = nav_changes(&buf[..n], &mut last_nav);
+                        if picker_open.load(Ordering::Relaxed) {
+                            for (code, pressed) in nav {
+                                cb(code, pressed);
+                            }
                         }
                     }
                     _ => break,
@@ -776,7 +815,7 @@ fn detect_button(timeout_ms: u64) -> Result<()> {
         if pressed {
             let _ = tx_paddles.send((code, "Steam Deck back buttons (hidraw)".to_string()));
         }
-    });
+    }, Arc::new(AtomicBool::new(false)));
     match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
         Ok((code, device)) => {
             let label = if is_paddle_code(code) {
@@ -877,10 +916,11 @@ fn main() -> Result<()> {
 
     let tx_paddles = tx.clone();
     let paddle_path = PathBuf::from(DECK_PADDLES_PATH);
+    let picker_open_flag = Arc::new(AtomicBool::new(false));
     let paddle_nodes = spawn_paddle_readers(move |code, pressed| {
         let ev = InputEvent::new(evdev::EventType::KEY, code, pressed as i32);
         let _ = tx_paddles.send(Msg::Input(paddle_path.clone(), ev));
-    });
+    }, Arc::clone(&picker_open_flag));
     if paddle_nodes > 0 {
         info!("Reading Steam Deck back buttons from {} hidraw node(s)", paddle_nodes);
         let _ = tx.send(Msg::Device {
@@ -1025,6 +1065,10 @@ fn main() -> Result<()> {
     // Slot macro/settings to restore once a macro started from the picker stops.
     let mut picker_restore: Option<(Vec<MacroEvent>, i32, bool)> = None;
     let mut force_replay = false;
+    // Picker navigation read from the Deck's raw HID reports (more reliable than
+    // the virtual gamepad's D-pad); used instead of the grabbed device when available.
+    let mut pending_nav: Vec<PickerAction> = Vec::new();
+    let mut picker_logged_events = 0;
 
     let mut write_devices: HashMap<PathBuf, Device> = HashMap::new();
     let mut ignore_injected: EchoMap = HashMap::new();
@@ -1088,14 +1132,26 @@ fn main() -> Result<()> {
             match fetched {
                 Ok(evs) => {
                     for ev in evs {
+                        if ev.event_type() != evdev::EventType::SYNCHRONIZATION && picker_logged_events < 40 {
+                            picker_logged_events += 1;
+                            info!("Picker input: type={} code={} value={}", ev.event_type().0, ev.code(), ev.value());
+                        }
                         if let Some(a) = p.action_for(&ev, config.trigger_picker_code) {
-                            actions.push(a);
+                            // With the Deck's raw reports available, D-pad/A/B come from
+                            // there; only the stick and the picker button are taken
+                            // from the grabbed device.
+                            let from_stick = ev.event_type() == evdev::EventType::ABSOLUTE && ev.code() == ABS_Y;
+                            let is_picker_key = a == PickerAction::Close && ev.code() == config.trigger_picker_code;
+                            if paddle_nodes == 0 || from_stick || is_picker_key {
+                                actions.push(a);
+                            }
                         }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => gone = true,
             }
+            actions.extend(pending_nav.drain(..));
             let mut launch: Option<PickerItem> = None;
             let mut close = gone || now.duration_since(p.last_input) > Duration::from_secs(20);
             for a in actions {
@@ -1111,6 +1167,7 @@ fn main() -> Result<()> {
             if close {
                 let p = picker.take().unwrap();
                 let target = p.target.clone();
+                picker_open_flag.store(false, Ordering::Relaxed);
                 p.close();
                 if let Some(item) = launch {
                     let events = load_macro(Path::new(&item.path));
@@ -1156,6 +1213,19 @@ fn main() -> Result<()> {
                 }
                 seen_record_key |= has_record_key;
                 seen_replay_key |= has_replay_key;
+                None
+            }
+            Some(Msg::Input(path, event))
+                if path.as_os_str() == DECK_PADDLES_PATH && is_nav_code(event.code()) =>
+            {
+                if picker.is_some() && event.value() == 1 {
+                    pending_nav.push(match event.code() {
+                        0x220 => PickerAction::Up,
+                        0x221 => PickerAction::Down,
+                        0x130 => PickerAction::Launch,
+                        _ => PickerAction::Close,
+                    });
+                }
                 None
             }
             Some(Msg::Input(path, event)) => Some((path, event)),
@@ -1402,6 +1472,7 @@ fn main() -> Result<()> {
         };
         if picker_fire && state == State::Idle {
             if let Some(p) = picker.take() {
+                picker_open_flag.store(false, Ordering::Relaxed);
                 p.close();
             } else {
                 if is_replaying {
@@ -1421,9 +1492,16 @@ fn main() -> Result<()> {
                                 .copied()
                                 .unwrap_or_else(|| AxisRange::fallback(ABS_Y));
                             let p = Picker { items, selected: 0, dev, target, stick_range, stick_latch: 0, last_input: now };
-                            info!("Picker opened with {} macro(s)", p.items.len());
+                            info!(
+                                "Picker opened with {} macro(s); navigation from {}",
+                                p.items.len(),
+                                if paddle_nodes > 0 { "the Deck controller (hidraw)" } else { "the gamepad" }
+                            );
                             p.show();
                             picker = Some(p);
+                            picker_open_flag.store(true, Ordering::Relaxed);
+                            pending_nav.clear();
+                            picker_logged_events = 0;
                         }
                         Err(e) => error!("Picker: cannot open gamepad {:?}: {}", target, e),
                     }
@@ -1783,5 +1861,23 @@ mod tests {
         assert_eq!(c.hold(Trigger::Replay), Duration::from_millis(0));
         assert_eq!(c.press_window(Trigger::Replay), Duration::from_millis(300));
         assert_eq!(c.press_window(Trigger::Picker), Duration::from_millis(900));
+    }
+
+    #[test]
+    fn nav_report_parsing() {
+        let mut report = [0u8; 64];
+        report[0] = 1;
+        report[2] = 9;
+        let mut last = [false; 4];
+        assert!(nav_changes(&report, &mut last).is_empty());
+        report[9] = 0b1000; // D-pad down
+        assert_eq!(nav_changes(&report, &mut last), vec![(0x221, true)]);
+        report[9] = 0b0001; // up (down released)
+        assert_eq!(nav_changes(&report, &mut last), vec![(0x220, true), (0x221, false)]);
+        report[9] = 0;
+        report[8] = 0x80; // A
+        assert_eq!(nav_changes(&report, &mut last), vec![(0x220, false), (0x130, true)]);
+        report[8] = 0x20; // B
+        assert_eq!(nav_changes(&report, &mut last), vec![(0x130, false), (0x131, true)]);
     }
 }
