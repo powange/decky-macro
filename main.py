@@ -186,7 +186,7 @@ class Plugin:
             decky_plugin.logger.error("Picker overlay: python3 or overlay script not found")
             return
         env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
-        env["DISPLAY"] = ":0"
+        env["DISPLAY"] = os.environ.get("DECKY_MACRO_TEST_DISPLAY", ":0")
         user_kwargs = {}
         if os.geteuid() == 0:
             # The overlay runs as the desktop user, who owns the gamescope X session.
@@ -214,8 +214,17 @@ class Plugin:
 
     def _overlay_send(self, message):
         if message.get("menu") is None:
-            # Menu closed: remove the overlay window entirely.
+            # Menu closed: blank the window first, then remove it entirely.
+            proc = getattr(self, "overlay", None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.stdin.write(b'{"menu": null}\n')
+                    proc.stdin.flush()
+                    time.sleep(0.1)
+                except Exception:
+                    pass
             self._stop_overlay()
+            decky_plugin.logger.info("Picker overlay closed")
             return
         proc = getattr(self, "overlay", None)
         if proc is None or proc.poll() is not None:

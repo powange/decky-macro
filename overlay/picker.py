@@ -105,6 +105,9 @@ XPending = _sig(x11, "XPending", c_int, c_void_p)
 XNextEvent = _sig(x11, "XNextEvent", c_int, c_void_p, c_void_p)
 XConnectionNumber = _sig(x11, "XConnectionNumber", c_int, c_void_p)
 XCloseDisplay = _sig(x11, "XCloseDisplay", c_int, c_void_p)
+XUnmapWindow = _sig(x11, "XUnmapWindow", c_int, c_void_p, c_ulong)
+XDestroyWindow = _sig(x11, "XDestroyWindow", c_int, c_void_p, c_ulong)
+XSync = _sig(x11, "XSync", c_int, c_void_p, c_int)
 
 c_surface_create = _sig(cairo, "cairo_xlib_surface_create", c_void_p, c_void_p, c_ulong, c_void_p, c_int, c_int)
 c_create = _sig(cairo, "cairo_create", c_void_p, c_void_p)
@@ -330,6 +333,7 @@ def main():
             except BlockingIOError:
                 chunk = None
             if chunk == b"":
+                sys.stderr.write("picker: stdin closed, exiting\n")
                 break  # backend closed the pipe
             if chunk:
                 buf += chunk
@@ -340,6 +344,7 @@ def main():
                         continue
                     try:
                         menu = json.loads(line).get("menu")
+                        sys.stderr.write("picker: hide\n" if menu is None else "")
                     except (ValueError, AttributeError):
                         sys.stderr.write(f"picker: bad message {line[:200]!r}\n")
         if overlay.fd in readable:
@@ -350,7 +355,14 @@ def main():
             overlay.render(menu)
             last_key = key
 
+    # Leave a transparent frame and remove the window explicitly, so gamescope
+    # can't keep showing the last menu frame after we exit.
+    overlay.render(None)
+    XUnmapWindow(overlay.dpy, overlay.win)
+    XDestroyWindow(overlay.dpy, overlay.win)
+    XSync(overlay.dpy, 0)
     XCloseDisplay(overlay.dpy)
+    sys.stderr.write("picker: window destroyed\n")
 
 
 if __name__ == "__main__":
