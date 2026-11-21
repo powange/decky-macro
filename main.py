@@ -15,6 +15,11 @@ DEFAULT_CONFIG = {
     "trigger_record_code": 317,
     "trigger_replay_code": 318,
     "hold_duration_ms": 500,
+    "record_trigger_mode": "hold",
+    "replay_trigger_mode": "hold",
+    "record_press_count": 3,
+    "replay_press_count": 3,
+    "press_window_ms": 400,
     "show_info_toasts": True,
 }
 

@@ -215,6 +215,37 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
   const [recordLabel, setRecordLabel] = useState<string | undefined>(initialConfig?.trigger_record_label);
   const [replayLabel, setReplayLabel] = useState<string | undefined>(initialConfig?.trigger_replay_label);
   const [detecting, setDetecting] = useState<string>("");
+  const [recordMode, setRecordMode] = useState<string>(initialConfig?.record_trigger_mode ?? "hold");
+  const [replayMode, setReplayMode] = useState<string>(initialConfig?.replay_trigger_mode ?? "hold");
+  const [recordCount, setRecordCount] = useState<number>(initialConfig?.record_press_count ?? 3);
+  const [replayCount, setReplayCount] = useState<number>(initialConfig?.replay_press_count ?? 3);
+  const [pressWindowMs, setPressWindowMs] = useState<number>(initialConfig?.press_window_ms ?? 400);
+
+  const modeOptions = [
+    { data: "hold", label: "Long press" },
+    { data: "multi_press", label: "Repeated presses" },
+  ];
+  const triggerMode = (
+    mode: string,
+    setMode: (m: string) => void,
+    count: number,
+    setCount: (n: number) => void
+  ) => (
+    <>
+      <Dropdown rgOptions={modeOptions} selectedOption={mode} onChange={(opt: any) => setMode(opt.data)} />
+      {mode === "multi_press" && (
+        <SliderField
+          label="Presses in a row"
+          value={count}
+          min={2}
+          max={10}
+          step={1}
+          showValue={true}
+          onChange={(v: number) => setCount(Math.round(v))}
+        />
+      )}
+    </>
+  );
 
   const detect = async (which: "record" | "replay") => {
     setDetecting(which);
@@ -240,6 +271,11 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
           trigger_record_label: recordLabel,
           trigger_replay_label: replayLabel,
           hold_duration_ms: holdMs,
+          record_trigger_mode: recordMode,
+          replay_trigger_mode: replayMode,
+          record_press_count: recordCount,
+          replay_press_count: replayCount,
+          press_window_ms: pressWindowMs,
         });
         closeModal();
       }}
@@ -260,6 +296,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
         <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("record")}>
           {detecting === "record" ? "Press the button now (10 s)..." : "Detect record button"}
         </ButtonItem>
+        {triggerMode(recordMode, setRecordMode, recordCount, setRecordCount)}
 
         <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Replay Trigger:</b></div>
         <Dropdown
@@ -270,8 +307,23 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
         <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("replay")}>
           {detecting === "replay" ? "Press the button now (10 s)..." : "Detect replay button"}
         </ButtonItem>
+        {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount)}
 
         <div style={{ marginTop: "12px" }}>
+          {(recordMode === "multi_press" || replayMode === "multi_press") && (
+            <SliderField
+              label="Max time between presses"
+              description="Presses further apart than this start a new series"
+              value={pressWindowMs / 1000}
+              min={0.2}
+              max={1}
+              step={0.05}
+              showValue={true}
+              valueSuffix="s"
+              onChange={(v: number) => setPressWindowMs(Math.round(v * 1000))}
+            />
+          )}
+          {(recordMode === "hold" || replayMode === "hold") && (
           <SliderField
             label="Trigger hold time"
             description="How long to hold Record/Replay before it activates (0 = trigger on press)"
@@ -283,6 +335,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
             valueSuffix="s"
             onChange={(v: number) => setHoldMs(Math.round(v * 1000))}
           />
+          )}
         </div>
       </div>
     </ConfirmModal>

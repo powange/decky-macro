@@ -170,6 +170,57 @@ struct Config {
     // config files written before this field existed keep their old behaviour.
     #[serde(default = "default_hold_ms")]
     hold_duration_ms: u64,
+    // How each trigger activates: held for hold_duration_ms, or pressed
+    // N times in a row (each press within press_window_ms of the previous).
+    #[serde(default)]
+    record_trigger_mode: TriggerMode,
+    #[serde(default)]
+    replay_trigger_mode: TriggerMode,
+    #[serde(default = "default_press_count")]
+    record_press_count: u32,
+    #[serde(default = "default_press_count")]
+    replay_press_count: u32,
+    #[serde(default = "default_press_window_ms")]
+    press_window_ms: u64,
+}
+
+fn default_press_count() -> u32 {
+    3
+}
+
+fn default_press_window_ms() -> u64 {
+    400
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+enum TriggerMode {
+    #[default]
+    Hold,
+    MultiPress,
+}
+
+/// Counts consecutive presses of a trigger button for TriggerMode::MultiPress.
+#[derive(Default)]
+struct PressCounter {
+    count: u32,
+    last: Option<Instant>,
+}
+
+impl PressCounter {
+    /// Registers a press; returns true when it completes the series.
+    fn press(&mut self, now: Instant, window: Duration, needed: u32) -> bool {
+        let in_series = self.last.map_or(false, |t| now.duration_since(t) <= window);
+        self.count = if in_series { self.count + 1 } else { 1 };
+        self.last = Some(now);
+        if self.count >= needed.max(1) {
+            self.count = 0;
+            self.last = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -224,6 +275,11 @@ fn load_or_create_config(path: &str) -> Config {
         trigger_record_code: 317,
         trigger_replay_code: 318,
         hold_duration_ms: default_hold_ms(),
+        record_trigger_mode: TriggerMode::Hold,
+        replay_trigger_mode: TriggerMode::Hold,
+        record_press_count: default_press_count(),
+        replay_press_count: default_press_count(),
+        press_window_ms: default_press_window_ms(),
     }
 }
 
@@ -618,6 +674,12 @@ fn main() -> Result<()> {
     info!("Loops: {}, Cancel: {}, Record analog: {}, 4 directions: {}", loops, cancel_on_input, record_analog, cardinal_only);
     info!("Triggers: record={}, replay={}", key_label(config.trigger_record_code), key_label(config.trigger_replay_code));
     info!("Trigger hold duration: {} ms", config.hold_duration_ms);
+    info!(
+        "Trigger modes: record={:?} (x{}), replay={:?} (x{}), press window {} ms",
+        config.record_trigger_mode, config.record_press_count,
+        config.replay_trigger_mode, config.replay_press_count,
+        config.press_window_ms
+    );
 
     let (tx, rx) = mpsc::channel::<Msg>();
     let tx_discovery = tx.clone();
@@ -761,6 +823,10 @@ fn main() -> Result<()> {
     let mut replay_held_since: Option<Instant> = None;
     let mut record_triggered_this_press = false;
     let mut replay_triggered_this_press = false;
+    let mut record_presses = PressCounter::default();
+    let mut replay_presses = PressCounter::default();
+    let mut record_multi_fire = false;
+    let mut replay_multi_fire = false;
 
     let mut write_devices: HashMap<PathBuf, Device> = HashMap::new();
     let mut ignore_injected: EchoMap = HashMap::new();
@@ -913,6 +979,11 @@ fn main() -> Result<()> {
                     if record_held_since.is_none() {
                         record_held_since = Some(now);
                         record_triggered_this_press = false;
+                        if config.record_trigger_mode == TriggerMode::MultiPress
+                            && record_presses.press(now, Duration::from_millis(config.press_window_ms), config.record_press_count)
+                        {
+                            record_multi_fire = true;
+                        }
                     }
                 } else if value == 0 {
                     record_held_since = None;
@@ -923,6 +994,11 @@ fn main() -> Result<()> {
                     if replay_held_since.is_none() {
                         replay_held_since = Some(now);
                         replay_triggered_this_press = false;
+                        if config.replay_trigger_mode == TriggerMode::MultiPress
+                            && replay_presses.press(now, Duration::from_millis(config.press_window_ms), config.replay_press_count)
+                        {
+                            replay_multi_fire = true;
+                        }
                     }
                 } else if value == 0 {
                     replay_held_since = None;
@@ -983,74 +1059,92 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Some(held) = record_held_since {
-            if !record_triggered_this_press && held.elapsed() >= Duration::from_millis(config.hold_duration_ms) {
-                if replay_held_since.is_none() {
+        let record_fire = match config.record_trigger_mode {
+            TriggerMode::MultiPress => std::mem::take(&mut record_multi_fire),
+            TriggerMode::Hold => {
+                let fire = record_held_since.map_or(false, |held| {
+                    !record_triggered_this_press
+                        && held.elapsed() >= Duration::from_millis(config.hold_duration_ms)
+                        && replay_held_since.is_none()
+                });
+                if fire {
                     record_triggered_this_press = true;
-                    if state == State::Idle {
-                        state = State::Recording;
-                        recorded_events.clear();
-                        record_start_time = Instant::now();
-                        if is_replaying {
-                            pending_recenter = true;
-                        }
-                        is_replaying = false;
-                        if record_analog {
-                            recorded_events.extend(analog_recorder.start(&axis_state));
-                        }
-                        info!("Started recording to {:?} (hold {}ms)", active_macro_path, config.hold_duration_ms);
-                    } else {
-                        state = State::Idle;
-                        let has_input = !recorded_events.is_empty();
-                        if !has_input {
-                            error!("Recording stopped with no inputs; previous macro kept.");
-                            // Keep in-memory state consistent with the (unchanged)
-                            // file so a later replay uses the previous macro, if any.
-                            recorded_events = load_macro(&active_macro_path);
-                        } else {
-                            let elapsed = record_start_time.elapsed();
-                            let tail = analog_recorder.finish(elapsed, |c| range_for(&axis_ranges, &last_active_device, c));
-                            recorded_events.extend(tail);
-                            save_macro(&active_macro_path, &recorded_events);
-                            info!("Stopped recording. Saved {} events.", recorded_events.len());
-                        }
-                    }
+                }
+                fire
+            }
+        };
+        if record_fire {
+            if state == State::Idle {
+                state = State::Recording;
+                recorded_events.clear();
+                record_start_time = Instant::now();
+                if is_replaying {
+                    pending_recenter = true;
+                }
+                is_replaying = false;
+                if record_analog {
+                    recorded_events.extend(analog_recorder.start(&axis_state));
+                }
+                info!("Started recording to {:?} (hold {}ms)", active_macro_path, config.hold_duration_ms);
+            } else {
+                state = State::Idle;
+                let has_input = !recorded_events.is_empty();
+                if !has_input {
+                    error!("Recording stopped with no inputs; previous macro kept.");
+                    // Keep in-memory state consistent with the (unchanged)
+                    // file so a later replay uses the previous macro, if any.
+                    recorded_events = load_macro(&active_macro_path);
+                } else {
+                    let elapsed = record_start_time.elapsed();
+                    let tail = analog_recorder.finish(elapsed, |c| range_for(&axis_ranges, &last_active_device, c));
+                    recorded_events.extend(tail);
+                    save_macro(&active_macro_path, &recorded_events);
+                    info!("Stopped recording. Saved {} events.", recorded_events.len());
                 }
             }
         }
 
-        if let Some(held) = replay_held_since {
-            if !replay_triggered_this_press && held.elapsed() >= Duration::from_millis(config.hold_duration_ms) {
-                if record_held_since.is_none() {
+        let replay_fire = match config.replay_trigger_mode {
+            TriggerMode::MultiPress => std::mem::take(&mut replay_multi_fire),
+            TriggerMode::Hold => {
+                let fire = replay_held_since.map_or(false, |held| {
+                    !replay_triggered_this_press
+                        && held.elapsed() >= Duration::from_millis(config.hold_duration_ms)
+                        && record_held_since.is_none()
+                });
+                if fire {
                     replay_triggered_this_press = true;
-                    if state == State::Idle {
-                        // Target: the gamepad used last, else the newest gamepad.
-                        let target_ok = last_active_device.as_ref().map_or(false, |d| gamepads.is_empty() || gamepads.contains(d));
-                        if !target_ok {
-                            last_active_device = last_gamepad.clone();
-                        }
-                        if recorded_events.is_empty() {
-                            error!("Playback failed: no recorded inputs for {:?}", active_macro_path);
-                        } else if last_active_device.is_none() {
-                            error!("Playback failed: no gamepad found to send the macro to");
-                        } else {
-                            let target = last_active_device.clone().unwrap();
-                            info!(
-                                "Playback target: {:?} ({}), {} events",
-                                target,
-                                device_names.get(&target).map(String::as_str).unwrap_or("?"),
-                                recorded_events.len()
-                            );
-                            is_replaying = true;
-                            replay_index = 0;
-                            current_iteration = 0;
-                            replay_start_time = Instant::now();
-                            axis_overrides = 0;
-                            injected_count = 0;
-                            playback_started = Instant::now();
-                            info!("Started playback from {:?} (hold {}ms)", active_macro_path, config.hold_duration_ms);
-                        }
-                    }
+                }
+                fire
+            }
+        };
+        if replay_fire {
+            if state == State::Idle {
+                // Target: the gamepad used last, else the newest gamepad.
+                let target_ok = last_active_device.as_ref().map_or(false, |d| gamepads.is_empty() || gamepads.contains(d));
+                if !target_ok {
+                    last_active_device = last_gamepad.clone();
+                }
+                if recorded_events.is_empty() {
+                    error!("Playback failed: no recorded inputs for {:?}", active_macro_path);
+                } else if last_active_device.is_none() {
+                    error!("Playback failed: no gamepad found to send the macro to");
+                } else {
+                    let target = last_active_device.clone().unwrap();
+                    info!(
+                        "Playback target: {:?} ({}), {} events",
+                        target,
+                        device_names.get(&target).map(String::as_str).unwrap_or("?"),
+                        recorded_events.len()
+                    );
+                    is_replaying = true;
+                    replay_index = 0;
+                    current_iteration = 0;
+                    replay_start_time = Instant::now();
+                    axis_overrides = 0;
+                    injected_count = 0;
+                    playback_started = Instant::now();
+                    info!("Started playback from {:?} (hold {}ms)", active_macro_path, config.hold_duration_ms);
                 }
             }
         }
@@ -1303,5 +1397,35 @@ mod tests {
         assert!(is_system_key(Key::KEY_POWER.code()));
         assert!(!is_system_key(Key::BTN_SOUTH.code()));
         assert!(!is_system_key(Key::KEY_F10.code()));
+    }
+
+    #[test]
+    fn multi_press_counter() {
+        let w = Duration::from_millis(400);
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut c = PressCounter::default();
+        assert!(!c.press(ms(0), w, 3));
+        assert!(!c.press(ms(300), w, 3));
+        assert!(c.press(ms(600), w, 3), "3rd press within the window fires");
+        // series restarts after firing
+        assert!(!c.press(ms(700), w, 3));
+        // a pause longer than the window resets the count
+        assert!(!c.press(ms(1200), w, 3));
+        assert!(!c.press(ms(1500), w, 3));
+        assert!(c.press(ms(1800), w, 3));
+    }
+
+    #[test]
+    fn config_defaults_for_old_files() {
+        let c: Config = serde_json::from_str(r#"{"trigger_record_code":317,"trigger_replay_code":318}"#).unwrap();
+        assert_eq!(c.record_trigger_mode, TriggerMode::Hold);
+        assert_eq!(c.replay_press_count, 3);
+        assert_eq!(c.press_window_ms, 400);
+        let c: Config = serde_json::from_str(
+            r#"{"trigger_record_code":317,"trigger_replay_code":551,"replay_trigger_mode":"multi_press","replay_press_count":5}"#,
+        ).unwrap();
+        assert_eq!(c.replay_trigger_mode, TriggerMode::MultiPress);
+        assert_eq!(c.replay_press_count, 5);
     }
 }
