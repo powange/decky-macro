@@ -25,6 +25,7 @@ const ABS_RX: u16 = 0x03;
 const ABS_RY: u16 = 0x04;
 const ABS_RZ: u16 = 0x05;
 const ABS_HAT2X: u16 = 0x14;
+const ABS_HAT0Y: u16 = 0x11;
 const ABS_HAT2Y: u16 = 0x15;
 const ANALOG_AXES: [u16; 8] = [ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT2X, ABS_HAT2Y];
 
@@ -182,6 +183,13 @@ struct Config {
     replay_press_count: u32,
     #[serde(default = "default_press_window_ms")]
     press_window_ms: u64,
+    // Macro picker trigger (0 = disabled).
+    #[serde(default)]
+    trigger_picker_code: u16,
+    #[serde(default)]
+    picker_trigger_mode: TriggerMode,
+    #[serde(default = "default_press_count")]
+    picker_press_count: u32,
 }
 
 fn default_press_count() -> u32 {
@@ -280,6 +288,9 @@ fn load_or_create_config(path: &str) -> Config {
         record_press_count: default_press_count(),
         replay_press_count: default_press_count(),
         press_window_ms: default_press_window_ms(),
+        trigger_picker_code: 0,
+        picker_trigger_mode: TriggerMode::Hold,
+        picker_press_count: default_press_count(),
     }
 }
 
@@ -544,6 +555,130 @@ where
     nodes.len()
 }
 
+// ---- Macro picker ----
+// A third trigger opens an in-game list of all recorded macros (drawn by the
+// overlay process, see overlay/picker.py). While it is open the daemon grabs
+// the gamepad so the game doesn't see the navigation presses.
+
+#[derive(Deserialize, Clone, Debug)]
+struct PickerItem {
+    name: String,
+    path: String,
+    #[serde(default)]
+    loops: i32,
+    #[serde(default = "default_true")]
+    cancel_on_input: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Recorded macros listed in the picker file written by the plugin backend.
+fn load_picker_items(path: &str) -> Vec<PickerItem> {
+    let items: Vec<PickerItem> = fs::read_to_string(path)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default();
+    items
+        .into_iter()
+        .filter(|it| !load_macro(Path::new(&it.path)).is_empty())
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum PickerAction {
+    Up,
+    Down,
+    Launch,
+    Close,
+}
+
+struct Picker {
+    items: Vec<PickerItem>,
+    selected: usize,
+    dev: Device,
+    target: PathBuf,
+    stick_range: AxisRange,
+    stick_latch: i32,
+    last_input: Instant,
+}
+
+impl Picker {
+    fn show(&self) {
+        let names: Vec<&str> = self.items.iter().map(|i| i.name.as_str()).collect();
+        let msg = serde_json::json!({ "title": "Choose a macro", "items": names, "selected": self.selected });
+        println!("PICKER_SHOW {}", msg);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Maps a gamepad event to a picker action. D-pad (buttons or hat),
+    /// left stick (with a latch so one push = one step), A launches, B closes.
+    fn action_for(&mut self, ev: &InputEvent, picker_code: u16) -> Option<PickerAction> {
+        match ev.kind() {
+            InputEventKind::Key(k) if ev.value() == 1 => match k {
+                Key::BTN_DPAD_UP => Some(PickerAction::Up),
+                Key::BTN_DPAD_DOWN => Some(PickerAction::Down),
+                Key::BTN_SOUTH => Some(PickerAction::Launch),
+                Key::BTN_EAST => Some(PickerAction::Close),
+                k if k.code() == picker_code => Some(PickerAction::Close),
+                _ => None,
+            },
+            InputEventKind::AbsAxis(a) if a.0 == ABS_HAT0Y => match ev.value() {
+                v if v < 0 => Some(PickerAction::Up),
+                v if v > 0 => Some(PickerAction::Down),
+                _ => None,
+            },
+            InputEventKind::AbsAxis(a) if a.0 == ABS_Y => {
+                let p = self.stick_range.level_position(ev.value()) / ANALOG_LEVELS as f32;
+                if p.abs() < 0.3 {
+                    self.stick_latch = 0;
+                    None
+                } else if p <= -0.6 && self.stick_latch != -1 {
+                    self.stick_latch = -1;
+                    Some(PickerAction::Up)
+                } else if p >= 0.6 && self.stick_latch != 1 {
+                    self.stick_latch = 1;
+                    Some(PickerAction::Down)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn step(&mut self, delta: i32) {
+        let n = self.items.len() as i32;
+        if n > 0 {
+            self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    fn close(mut self) {
+        let _ = self.dev.ungrab();
+        println!("PICKER_HIDE");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// Opens `target` for exclusive, non-blocking reading.
+fn open_grabbed(target: &Path) -> std::io::Result<Device> {
+    use std::os::unix::io::AsRawFd;
+    let mut dev = Device::open(target)?;
+    let fd = dev.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    if let Err(e) = dev.grab() {
+        warn!("Picker: could not grab {:?} ({}); the game will also see the menu presses", target, e);
+    }
+    Ok(dev)
+}
+
 /// Keys a trigger can be learnt from. Excludes A/B (used to navigate the Steam
 /// UI), mouse buttons (trackpad clicks) and touch/digitizer events such as
 /// BTN_TOUCH, which the touchscreen and trackpads send on every contact.
@@ -647,6 +782,7 @@ fn main() -> Result<()> {
     let mut macro_file = String::new();
     let mut loops: i32 = 0;
     let mut cancel_on_input = true;
+    let mut picker_file = String::new();
     let mut record_analog = true;
     let mut cardinal_only = false;
 
@@ -659,6 +795,7 @@ fn main() -> Result<()> {
             "--cancel-on-input" => { cancel_on_input = args[i + 1] == "true"; i += 2; }
             "--record-analog" => { record_analog = args[i + 1] == "true"; i += 2; }
             "--cardinal-only" => { cardinal_only = args[i + 1] == "true"; i += 2; }
+            "--picker-file" => { picker_file = args[i + 1].clone(); i += 2; }
             _ => i += 1,
         }
     }
@@ -827,6 +964,14 @@ fn main() -> Result<()> {
     let mut replay_presses = PressCounter::default();
     let mut record_multi_fire = false;
     let mut replay_multi_fire = false;
+    let mut picker_held_since: Option<Instant> = None;
+    let mut picker_triggered_this_press = false;
+    let mut picker_presses = PressCounter::default();
+    let mut picker_multi_fire = false;
+    let mut picker: Option<Picker> = None;
+    // Slot macro/settings to restore once a macro started from the picker stops.
+    let mut picker_restore: Option<(Vec<MacroEvent>, i32, bool)> = None;
+    let mut force_replay = false;
 
     let mut write_devices: HashMap<PathBuf, Device> = HashMap::new();
     let mut ignore_injected: EchoMap = HashMap::new();
@@ -877,9 +1022,55 @@ fn main() -> Result<()> {
         } else {
             Some(Duration::from_millis(50))
         };
+        let timeout = if picker.is_some() { timeout.map(|t| t.min(Duration::from_millis(16))) } else { timeout };
 
         let msg = if let Some(t) = timeout { rx.recv_timeout(t).ok() } else { rx.recv().ok() };
         let now = Instant::now();
+
+        // Picker navigation, read from the grabbed gamepad.
+        if let Some(p) = picker.as_mut() {
+            let mut actions = Vec::new();
+            let mut gone = false;
+            let fetched = p.dev.fetch_events().map(|evs| evs.collect::<Vec<InputEvent>>());
+            match fetched {
+                Ok(evs) => {
+                    for ev in evs {
+                        if let Some(a) = p.action_for(&ev, config.trigger_picker_code) {
+                            actions.push(a);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => gone = true,
+            }
+            let mut launch: Option<PickerItem> = None;
+            let mut close = gone || now.duration_since(p.last_input) > Duration::from_secs(20);
+            for a in actions {
+                p.last_input = now;
+                match a {
+                    PickerAction::Up => { p.step(-1); p.show(); }
+                    PickerAction::Down => { p.step(1); p.show(); }
+                    PickerAction::Launch => { launch = p.items.get(p.selected).cloned(); close = true; }
+                    PickerAction::Close => close = true,
+                }
+                if close { break; }
+            }
+            if close {
+                let p = picker.take().unwrap();
+                let target = p.target.clone();
+                p.close();
+                if let Some(item) = launch {
+                    let events = load_macro(Path::new(&item.path));
+                    info!("Picker: playing \"{}\" ({} events)", item.name, events.len());
+                    let saved = std::mem::replace(&mut recorded_events, events);
+                    picker_restore = Some((saved, loops, cancel_on_input));
+                    loops = item.loops;
+                    cancel_on_input = item.cancel_on_input;
+                    last_active_device = Some(target);
+                    force_replay = true;
+                }
+            }
+        }
 
         if now.duration_since(last_echo_purge) >= Duration::from_secs(1) {
             ignore_injected.retain(|_, (count, at)| *count > 0 && now.duration_since(*at) < ECHO_TTL);
@@ -968,8 +1159,28 @@ fn main() -> Result<()> {
             // a macro plays, and trigger buttons / non-gamepad devices (keyboard,
             // Steam's virtual keyboard...) never become the target.
             let is_gamepad_dev = gamepads.is_empty() || gamepads.contains(&device_path);
-            if is_significant && !is_replaying && is_gamepad_dev && !is_record_btn && !is_replay_btn {
+            if is_significant && !is_replaying && is_gamepad_dev && !is_record_btn && !is_replay_btn
+                && !(config.trigger_picker_code != 0 && matches!(kind, InputEventKind::Key(k) if k.code() == config.trigger_picker_code))
+            {
                 last_active_device = Some(device_path.clone());
+            }
+
+            let is_picker_btn = config.trigger_picker_code != 0
+                && matches!(kind, InputEventKind::Key(k) if k.code() == config.trigger_picker_code);
+            if is_picker_btn {
+                if value == 1 {
+                    if picker_held_since.is_none() {
+                        picker_held_since = Some(now);
+                        picker_triggered_this_press = false;
+                        if config.picker_trigger_mode == TriggerMode::MultiPress
+                            && picker_presses.press(now, Duration::from_millis(config.press_window_ms), config.picker_press_count)
+                        {
+                            picker_multi_fire = true;
+                        }
+                    }
+                } else if value == 0 {
+                    picker_held_since = None;
+                }
             }
 
             if is_record_btn {
@@ -1010,7 +1221,7 @@ fn main() -> Result<()> {
                 None => value != 0,
             };
             let is_system = matches!(kind, InputEventKind::Key(k) if is_system_key(k.code()));
-            if is_replaying && is_deliberate && !is_system && !is_record_btn && !is_replay_btn && cancel_on_input {
+            if is_replaying && is_deliberate && !is_system && !is_record_btn && !is_replay_btn && !is_picker_btn && cancel_on_input {
                 let lag_ms = std::time::SystemTime::now()
                     .duration_since(event.timestamp())
                     .ok()
@@ -1041,7 +1252,7 @@ fn main() -> Result<()> {
             // Back buttons can trigger and cancel, but can't be recorded: the
             // virtual gamepad the game reads has no such buttons to replay.
             let from_paddles = device_path.as_os_str() == DECK_PADDLES_PATH;
-            if state == State::Recording && !is_record_btn && !is_replay_btn && !from_paddles && !is_system {
+            if state == State::Recording && !is_record_btn && !is_replay_btn && !is_picker_btn && !from_paddles && !is_system {
                 if recorded_events.len() >= MAX_EVENTS {
                     state = State::Idle;
                     info!("Macro size limit reached. Stopped recording.");
@@ -1073,9 +1284,14 @@ fn main() -> Result<()> {
                 fire
             }
         };
-        if record_fire {
+        if record_fire && picker.is_none() {
             if state == State::Idle {
                 state = State::Recording;
+                if let Some((ev, l, c)) = picker_restore.take() {
+                    recorded_events = ev;
+                    loops = l;
+                    cancel_on_input = c;
+                }
                 recorded_events.clear();
                 record_start_time = Instant::now();
                 if is_replaying {
@@ -1118,7 +1334,53 @@ fn main() -> Result<()> {
                 fire
             }
         };
-        if replay_fire {
+        // Picker trigger: open the list (stopping any playback), or close it.
+        let picker_fire = config.trigger_picker_code != 0 && match config.picker_trigger_mode {
+            TriggerMode::MultiPress => std::mem::take(&mut picker_multi_fire),
+            TriggerMode::Hold => {
+                let fire = picker_held_since.map_or(false, |held| {
+                    !picker_triggered_this_press && held.elapsed() >= Duration::from_millis(config.hold_duration_ms)
+                });
+                if fire {
+                    picker_triggered_this_press = true;
+                }
+                fire
+            }
+        };
+        if picker_fire && state == State::Idle {
+            if let Some(p) = picker.take() {
+                p.close();
+            } else {
+                if is_replaying {
+                    is_replaying = false;
+                    pending_recenter = true;
+                }
+                let items = load_picker_items(&picker_file);
+                let target_ok = last_active_device.as_ref().map_or(false, |d| gamepads.contains(d));
+                let target = if target_ok { last_active_device.clone() } else { last_gamepad.clone() };
+                if items.is_empty() {
+                    error!("Picker: no recorded macro to choose from");
+                } else if let Some(target) = target {
+                    match open_grabbed(&target) {
+                        Ok(dev) => {
+                            let stick_range = axis_ranges
+                                .get(&(target.clone(), ABS_Y))
+                                .copied()
+                                .unwrap_or_else(|| AxisRange::fallback(ABS_Y));
+                            let p = Picker { items, selected: 0, dev, target, stick_range, stick_latch: 0, last_input: now };
+                            info!("Picker opened with {} macro(s)", p.items.len());
+                            p.show();
+                            picker = Some(p);
+                        }
+                        Err(e) => error!("Picker: cannot open gamepad {:?}: {}", target, e),
+                    }
+                } else {
+                    error!("Playback failed: no gamepad found to send the macro to");
+                }
+            }
+        }
+
+        if (replay_fire && picker.is_none()) || std::mem::take(&mut force_replay) {
             if state == State::Idle {
                 // Target: the gamepad used last, else the newest gamepad.
                 let target_ok = last_active_device.as_ref().map_or(false, |d| gamepads.is_empty() || gamepads.contains(d));
@@ -1205,6 +1467,15 @@ fn main() -> Result<()> {
                 cleanup_start.elapsed().as_millis()
             );
             axis_overrides = 0;
+        }
+
+        // Back to the selected slot once a macro started from the picker ends.
+        if !is_replaying && !pending_recenter {
+            if let Some((ev, l, c)) = picker_restore.take() {
+                recorded_events = ev;
+                loops = l;
+                cancel_on_input = c;
+            }
         }
 
         // Detect a stalled main loop (would delay injections and cancellation).
@@ -1427,5 +1698,25 @@ mod tests {
         ).unwrap();
         assert_eq!(c.replay_trigger_mode, TriggerMode::MultiPress);
         assert_eq!(c.replay_press_count, 5);
+    }
+
+    #[test]
+    fn picker_items_skip_empty_macros() {
+        let dir = std::env::temp_dir().join("decky-macro-picker-test");
+        let _ = fs::create_dir_all(&dir);
+        let full = dir.join("macro_1.json");
+        let empty = dir.join("macro_2.json");
+        save_macro(&full, &vec![MacroEvent { delay_ms: 0, event_type: 1, code: 304, value: 1 }]);
+        save_macro(&empty, &vec![]);
+        let list = dir.join("picker.json");
+        fs::write(&list, serde_json::json!([
+            {"name": "Farm", "path": full.to_string_lossy(), "loops": 0, "cancel_on_input": true},
+            {"name": "Empty", "path": empty.to_string_lossy()},
+            {"name": "Missing", "path": dir.join("nope.json").to_string_lossy()}
+        ]).to_string()).unwrap();
+        let items = load_picker_items(list.to_str().unwrap());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Farm");
+        assert!(load_picker_items("/nonexistent").is_empty());
     }
 }

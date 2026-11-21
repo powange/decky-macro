@@ -1,12 +1,13 @@
 [package]
 name = "decky-macro-daemon"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.104"
 env_logger = "0.11.11"
 evdev = "0.12.1"
+libc = "0.2"
 log = "0.4.34"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

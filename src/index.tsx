@@ -220,6 +220,10 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
   const [recordCount, setRecordCount] = useState<number>(initialConfig?.record_press_count ?? 3);
   const [replayCount, setReplayCount] = useState<number>(initialConfig?.replay_press_count ?? 3);
   const [pressWindowMs, setPressWindowMs] = useState<number>(initialConfig?.press_window_ms ?? 400);
+  const [pickerCode, setPickerCode] = useState<number>(initialConfig?.trigger_picker_code ?? 0);
+  const [pickerLabel, setPickerLabel] = useState<string | undefined>(initialConfig?.trigger_picker_label);
+  const [pickerMode, setPickerMode] = useState<string>(initialConfig?.picker_trigger_mode ?? "hold");
+  const [pickerCount, setPickerCount] = useState<number>(initialConfig?.picker_press_count ?? 3);
 
   const modeOptions = [
     { data: "hold", label: "Long press" },
@@ -247,12 +251,13 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
     </>
   );
 
-  const detect = async (which: "record" | "replay") => {
+  const detect = async (which: "record" | "replay" | "picker") => {
     setDetecting(which);
     try {
       const res = await detectTrigger(which);
       if (res?.code !== undefined) {
         if (which === "record") { setRecordCode(res.code); setRecordLabel(res.label); }
+        else if (which === "picker") { setPickerCode(res.code); setPickerLabel(res.label); }
         else { setReplayCode(res.code); setReplayLabel(res.label); }
       }
     } finally {
@@ -276,6 +281,10 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
           record_press_count: recordCount,
           replay_press_count: replayCount,
           press_window_ms: pressWindowMs,
+          trigger_picker_code: pickerCode,
+          trigger_picker_label: pickerLabel,
+          picker_trigger_mode: pickerMode,
+          picker_press_count: pickerCount,
         });
         closeModal();
       }}
@@ -309,8 +318,26 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
         </ButtonItem>
         {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount)}
 
+        <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Macro Picker Trigger:</b></div>
+        <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "5px" }}>
+          Shows the list of recorded macros in the middle of the screen: D-pad or stick to choose, A to play, B to close.
+        </div>
+        <Dropdown
+          rgOptions={[{ data: 0, label: "Disabled" }, ...withCustom(pickerCode || 317, pickerLabel).filter((o) => pickerCode !== 0 || o.data !== 0)]}
+          selectedOption={pickerCode}
+          onChange={(opt: any) => setPickerCode(opt.data)}
+        />
+        {pickerCode !== 0 && (
+          <>
+            <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("picker")}>
+              {detecting === "picker" ? "Press the button now (10 s)..." : "Detect picker button"}
+            </ButtonItem>
+            {triggerMode(pickerMode, setPickerMode, pickerCount, setPickerCount)}
+          </>
+        )}
+
         <div style={{ marginTop: "12px" }}>
-          {(recordMode === "multi_press" || replayMode === "multi_press") && (
+          {(recordMode === "multi_press" || replayMode === "multi_press" || (pickerCode !== 0 && pickerMode === "multi_press")) && (
             <SliderField
               label="Max time between presses"
               description="Presses further apart than this start a new series"
@@ -323,7 +350,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
               onChange={(v: number) => setPressWindowMs(Math.round(v * 1000))}
             />
           )}
-          {(recordMode === "hold" || replayMode === "hold") && (
+          {(recordMode === "hold" || replayMode === "hold" || (pickerCode !== 0 && pickerMode === "hold")) && (
           <SliderField
             label="Trigger hold time"
             description="How long to hold Record/Replay before it activates (0 = trigger on press)"
@@ -341,6 +368,27 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
     </ConfirmModal>
   );
 };
+
+const InfoModal = ({ closeModal }: any) => (
+  <ConfirmModal strTitle="How Decky Macro works" bAlertDialog={true} onOK={closeModal} onCancel={closeModal}>
+    <div style={{ fontSize: "13px", lineHeight: "1.5", color: "#ccc" }}>
+      <p>
+        Decky Macro runs a daemon that listens to hardware inputs (/dev/input/event*) to trigger and record
+        macros, and injects them back into the same gamepad. It doesn't know whether the inputs go to a game or to
+        the Steam client.
+      </p>
+      <p>
+        Analog sticks and triggers (L2/R2) are recorded in 4 steps per direction (25/50/75/100%), configurable per
+        slot. During playback, pushing a stick past halfway or pressing a button cancels the macro (volume and power
+        keys are ignored).
+      </p>
+      <p>
+        Back buttons (L4/L5/R4/R5) can be used as triggers. The optional macro picker trigger shows the list of
+        recorded macros in the middle of the screen: D-pad or left stick to choose, A to play, B to close.
+      </p>
+    </div>
+  </ConfirmModal>
+);
 
 function Content() {
   const [globalConfig, setGlobalConfig] = useState<any>(null);
@@ -457,17 +505,11 @@ function Content() {
 
   return (
     <>
-      <div style={{ padding: "10px", fontSize: "12px", lineHeight: "1.4", color: "#bbb" }}>
-        Decky-Macro listens (via a daemon) on hardware inputs (/dev/input/event*) to trigger/record inputs, and injects them into the same hardware device. This plugin is not aware if the inputs are injected into a game or steam client.
-      </div>
-
       <PanelSection>
-        <div style={{ padding: "0 10px 10px 10px", fontSize: "12px", color: "#ffcc00", fontWeight: "bold" }}>
-          Analog sticks and triggers (L2/R2) are recorded in 4 steps per direction (25/50/75/100%), configurable per slot. Pushing a stick past halfway cancels playback.
-        </div>
         <PanelSectionRow>
           <ToggleField
             label="Enable Decky Macro"
+            description="Stays on after a reboot if it was on"
             checked={isDaemonRunning}
             onChange={(val: boolean) => toggleDaemon(val)}
           />
@@ -514,9 +556,6 @@ function Content() {
 
         <PanelSectionRow>
           <div style={{ display: "flex", flexDirection: "column", gap: "5px", marginTop: "10px" }}>
-            <ButtonItem layout="below" onClick={handleNew}>
-              New Slot
-            </ButtonItem>
             <ButtonItem layout="below" onClick={handleEdit}>
               Edit Selected Slot
             </ButtonItem>
@@ -526,6 +565,9 @@ function Content() {
               disabled={activeSlotId === "0"}
             >
               Delete Selected Slot
+            </ButtonItem>
+            <ButtonItem layout="below" onClick={handleNew}>
+              New Slot
             </ButtonItem>
           </div>
         </PanelSectionRow>
@@ -541,6 +583,13 @@ function Content() {
               setTimeout(() => setGlobal({ ...globalConfig, show_info_toasts: val }), 0);
             }}
           />
+        </PanelSectionRow>
+      </PanelSection>
+      <PanelSection>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => showModal(<InfoModal />)}>
+            ⓘ How it works
+          </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
       <UpdateSection />

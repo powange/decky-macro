@@ -5,7 +5,14 @@ import json
 import threading
 import asyncio
 import traceback
+import pwd
+import shutil
+import time
 import decky_plugin
+
+# Environment variables set by Decky's bundled (PyInstaller) python that would
+# break the system python3 used for the picker overlay.
+_STRIP_ENV = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")
 
 # Default global config. `hold_duration_ms` is how long the record/replay
 # trigger buttons must be held before activating (0 = trigger on press).
@@ -20,6 +27,10 @@ DEFAULT_CONFIG = {
     "record_press_count": 3,
     "replay_press_count": 3,
     "press_window_ms": 400,
+    "trigger_picker_code": 0,
+    "picker_trigger_mode": "hold",
+    "picker_press_count": 3,
+    "daemon_enabled": False,
     "show_info_toasts": True,
 }
 
@@ -75,6 +86,7 @@ class Plugin:
             record_analog = "true" if slot_config.get("record_analog", True) else "false"
             cardinal_only = "true" if slot_config.get("cardinal_only", False) else "false"
             macro_file = os.path.join(self.config_dir, f"macro_{active_slot}.json")
+            picker_file = self._write_picker_file(data)
 
             decky_plugin.logger.info(f"Starting decky-macro-daemon daemon for slot {active_slot}...")
             Plugin.process = subprocess.Popen(
@@ -86,6 +98,7 @@ class Plugin:
                     "--cancel-on-input", cancel,
                     "--record-analog", record_analog,
                     "--cardinal-only", cardinal_only,
+                    "--picker-file", picker_file,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT
@@ -98,6 +111,14 @@ class Plugin:
                 with pipe:
                     for line in iter(pipe.readline, b''):
                         line_str = line.decode('utf-8', errors='replace').strip()
+
+                        # Picker menu messages go to the overlay, not the log.
+                        if line_str.startswith("PICKER_SHOW "):
+                            self._overlay_send({"menu": json.loads(line_str[len("PICKER_SHOW "):])})
+                            continue
+                        if line_str == "PICKER_HIDE":
+                            self._overlay_send({"menu": None})
+                            continue
                         decky_plugin.logger.info(f"[Rust] {line_str}")
 
                         if "Started recording to" in line_str:
@@ -120,14 +141,104 @@ class Plugin:
                             notify("Record button is not seen by the daemon - pick another one", error=True)
                         elif "Trigger not available: replay" in line_str:
                             notify("Replay button is not seen by the daemon - pick another one", error=True)
+                        elif "Picker: no recorded macro" in line_str:
+                            notify("No recorded macro to choose from", error=True)
+                        elif "Picker: cannot open gamepad" in line_str:
+                            notify("Macro picker: cannot read the gamepad", error=True)
                         
             threading.Thread(target=log_output, args=(Plugin.process.stdout,), daemon=True).start()
+            self._start_overlay()
             return True
         except Exception as e:
             decky_plugin.logger.error(f"Failed to start daemon: {e}\n{traceback.format_exc()}")
             return False
 
+    # ------------------------------------------------------------------ #
+    # Macro picker
+    # ------------------------------------------------------------------ #
+
+    def _write_picker_file(self, data) -> str:
+        """Lists every slot for the daemon's macro picker."""
+        path = os.path.join(self.config_dir, "picker.json")
+        items = []
+        slots = data.get("slots", {})
+        for sid in sorted(slots, key=lambda k: int(k) if str(k).isdigit() else 0):
+            sc = slots[sid]
+            items.append({
+                "name": sc.get("name") or f"Slot {sid}",
+                "path": os.path.join(self.config_dir, f"macro_{sid}.json"),
+                "loops": int(sc.get("loops", 0)),
+                "cancel_on_input": bool(sc.get("cancel_on_input", True)),
+            })
+        with open(path, "w") as f:
+            json.dump(items, f)
+        return path
+
+    def _start_overlay(self):
+        """Starts the in-game picker overlay when a picker trigger is set."""
+        self._stop_overlay()
+        try:
+            with open(self.config_path, "r") as f:
+                if not json.load(f).get("trigger_picker_code"):
+                    return
+        except Exception:
+            return
+        python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else shutil.which("python3")
+        script = os.path.join(decky_plugin.DECKY_PLUGIN_DIR, "overlay", "picker.py")
+        if not python or not os.path.exists(script):
+            decky_plugin.logger.error("Picker overlay: python3 or overlay script not found")
+            return
+        env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
+        env["DISPLAY"] = ":0"
+        user_kwargs = {}
+        if os.geteuid() == 0:
+            # The overlay runs as the desktop user, who owns the gamescope X session.
+            try:
+                pw = pwd.getpwnam(getattr(decky_plugin, "DECKY_USER", "deck"))
+                env.update({"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
+                            "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}"})
+                user_kwargs = {"user": pw.pw_uid, "group": pw.pw_gid}
+            except Exception as e:
+                decky_plugin.logger.warning(f"Picker overlay: cannot drop privileges: {e}")
+        log_path = os.path.join(decky_plugin.DECKY_PLUGIN_LOG_DIR, "picker-overlay.log")
+        try:
+            log = open(log_path, "a")
+            log.write(f"--- start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            log.flush()
+            self.overlay = subprocess.Popen(
+                [python, "-u", script], stdin=subprocess.PIPE, stdout=log, stderr=log,
+                env=env, cwd=os.path.dirname(script), **user_kwargs,
+            )
+            log.close()
+            decky_plugin.logger.info("Picker overlay started")
+        except Exception as e:
+            self.overlay = None
+            decky_plugin.logger.error(f"Picker overlay: start failed: {e}")
+
+    def _overlay_send(self, message):
+        proc = getattr(self, "overlay", None)
+        if proc is None or proc.poll() is not None:
+            if message.get("menu") is not None:
+                self.notifications.append({"message": "Macro picker overlay is not running (see picker-overlay.log)", "error": True})
+            return
+        try:
+            proc.stdin.write((json.dumps(message) + "\n").encode())
+            proc.stdin.flush()
+        except Exception as e:
+            decky_plugin.logger.error(f"Picker overlay: write failed: {e}")
+
+    def _stop_overlay(self):
+        proc = getattr(self, "overlay", None)
+        self.overlay = None
+        if proc is not None:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+
     def stop_daemon(self):
+        self._stop_overlay()
         if Plugin.process:
             decky_plugin.logger.info("Stopping decky-macro-daemon daemon...")
             Plugin.process.terminate()
@@ -138,7 +249,7 @@ class Plugin:
         """Waits for the next key press on any input device and saves it as the
         record or replay trigger. Lets back buttons work once Steam Input maps
         them to a keyboard key (the Deck does not expose them otherwise)."""
-        if which not in ("record", "replay"):
+        if which not in ("record", "replay", "picker"):
             return {"error": "invalid trigger"}
         if await self.get_daemon_state():
             return {"error": "Stop the daemon first"}
@@ -200,6 +311,13 @@ class Plugin:
         # Trigger/replay/hold settings are only read by the daemon at startup, so
         # the UI restricts editing them to when the daemon is stopped. We no longer
         # signal a running daemon here to reload (that behaviour was removed).
+        # `daemon_enabled` is owned by set_daemon_state: keep the stored value so
+        # a stale copy from the UI can't overwrite it.
+        config = dict(config)
+        config["daemon_enabled"] = (await self.get_config()).get("daemon_enabled", False)
+        return self._write_config(config)
+
+    def _write_config(self, config: dict) -> bool:
         try:
             with open(self.config_path, "w") as f:
                 json.dump(config, f, indent=4)
@@ -233,11 +351,19 @@ class Plugin:
                 raise Exception("Failed to start Decky Macro daemon. Check logs for details.")
         else:
             self.stop_daemon()
+        # Remember the choice so the daemon comes back after a reboot.
+        config = await self.get_config()
+        if config.get("daemon_enabled") != is_running:
+            config["daemon_enabled"] = is_running
+            self._write_config(config)
         return True
 
     async def _main(self):
-        # Daemon DOES NOT start by default anymore
-        pass
+        # Restart the daemon if it was enabled the last time.
+        config = await self.get_config()
+        if config.get("daemon_enabled"):
+            decky_plugin.logger.info("Daemon was enabled last time, starting it")
+            self.start_daemon()
 
     async def _unload(self):
         self.stop_daemon()
