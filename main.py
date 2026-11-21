@@ -130,6 +130,7 @@ class Plugin:
         if Plugin.process is not None and Plugin.process.poll() is None:
             Plugin.process.send_signal(signal.SIGHUP)
             decky_plugin.logger.info("Daemon asked to reload its settings")
+            self._ensure_overlay()
 
     def start_daemon(self) -> bool:
         self.stop_daemon()
@@ -229,6 +230,7 @@ class Plugin:
                             notify("Macro picker: cannot read the gamepad", error=True)
                         
             threading.Thread(target=log_output, args=(Plugin.process.stdout,), daemon=True).start()
+            self._ensure_overlay()
             return True
         except Exception as e:
             decky_plugin.logger.error(f"Failed to start daemon: {e}\n{traceback.format_exc()}")
@@ -256,12 +258,27 @@ class Plugin:
             json.dump(items, f)
         return path
 
+    def _ensure_overlay(self):
+        """Starts the overlay process ahead of time when a picker trigger is
+        set, so the menu shows without Python's start-up delay."""
+        try:
+            with open(self.config_path, "r") as f:
+                wanted = bool(json.load(f).get("trigger_picker_code"))
+        except Exception:
+            wanted = False
+        proc = getattr(self, "overlay", None)
+        running = proc is not None and proc.poll() is None
+        if wanted and not running and Plugin.process is not None and Plugin.process.poll() is None:
+            self._start_overlay()
+        elif not wanted and running:
+            self._stop_overlay()
+
     def _start_overlay(self):
-        """Starts the in-game picker overlay window.
+        """Starts the in-game picker overlay process.
 
         gamescope composites a single GAMESCOPE_EXTERNAL_OVERLAY window at a
-        time, so the overlay only exists while the picker menu is shown;
-        otherwise it would hide other plugins' overlays (e.g. Decky Timer)."""
+        time, so the process only creates its window while the picker menu is
+        shown; otherwise it would hide other plugins' overlays (Decky Timer)."""
         self._stop_overlay()
         python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else shutil.which("python3")
         script = os.path.join(decky_plugin.DECKY_PLUGIN_DIR, "overlay", "picker.py")
@@ -296,20 +313,17 @@ class Plugin:
             decky_plugin.logger.error(f"Picker overlay: start failed: {e}")
 
     def _overlay_send(self, message):
+        proc = getattr(self, "overlay", None)
         if message.get("menu") is None:
-            # Menu closed: blank the window first, then remove it entirely.
-            proc = getattr(self, "overlay", None)
+            # Menu closed: the overlay destroys its window and stays ready.
             if proc is not None and proc.poll() is None:
                 try:
                     proc.stdin.write(b'{"menu": null}\n')
                     proc.stdin.flush()
-                    time.sleep(0.1)
                 except Exception:
                     pass
-            self._stop_overlay()
             decky_plugin.logger.info("Picker overlay closed")
             return
-        proc = getattr(self, "overlay", None)
         if proc is None or proc.poll() is not None:
             self._start_overlay()
             proc = getattr(self, "overlay", None)

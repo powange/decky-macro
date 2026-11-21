@@ -49,6 +49,9 @@ const ANALOG_CANCEL_THRESHOLD: f32 = 0.5;
 // During playback, a physical stick pushed past this fraction takes over that
 // axis: the macro value is no longer re-asserted while the player holds it.
 const PLAYER_TAKEOVER: f32 = 0.25;
+// Minimum time between two re-assertions of the same held axis: Steam may
+// rewrite the stick very often, and each re-assert is one more event for the game.
+const REASSERT_MIN_INTERVAL: Duration = Duration::from_millis(4);
 
 // Left / right stick axis pairs, used by the "4 directions" recording mode.
 const STICK_PAIRS: [(u16, u16); 2] = [(ABS_X, ABS_Y), (ABS_RX, ABS_RY)];
@@ -960,6 +963,8 @@ enum Msg {
     Input(PathBuf, InputEvent),
     /// A device disappeared (its reader stopped).
     Removed(PathBuf),
+    /// A signal arrived (reload / stop flags were set): just wake the loop.
+    Wake,
 }
 
 #[derive(PartialEq)]
@@ -1018,10 +1023,7 @@ fn main() -> Result<()> {
     // SIGHUP: reload config + active slot (applied once idle).
     // SIGTERM: stop cleanly (release held inputs, save a recording in progress).
     let reload_config = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload_config))?;
     let terminate = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&terminate))?;
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminate))?;
 
     info!("Loaded active slot: {:?}", active_macro_path);
     info!("Loops: {}, Cancel: {}, Record analog: {}, 4 directions: {}", loops, cancel_on_input, record_analog, cardinal_only);
@@ -1042,6 +1044,24 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
     let tx_discovery = tx.clone();
+
+    // Signals are handled on their own thread, which sets the flags and wakes
+    // the main loop: it can then block with no timeout while idle.
+    {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        let mut signals = signal_hook::iterator::Signals::new([SIGHUP, SIGTERM, SIGINT])?;
+        let (reload, term, tx_sig) = (Arc::clone(&reload_config), Arc::clone(&terminate), tx.clone());
+        thread::spawn(move || {
+            for sig in signals.forever() {
+                if sig == SIGHUP {
+                    reload.store(true, Ordering::Relaxed);
+                } else {
+                    term.store(true, Ordering::Relaxed);
+                }
+                let _ = tx_sig.send(Msg::Wake);
+            }
+        });
+    }
 
     let tx_paddles = tx.clone();
     let paddle_path = PathBuf::from(DECK_PADDLES_PATH);
@@ -1066,6 +1086,25 @@ fn main() -> Result<()> {
     // gamepad when a game starts, after a reboot...) is picked up again.
     let opened_paths: Arc<std::sync::Mutex<HashSet<PathBuf>>> = Arc::new(std::sync::Mutex::new(HashSet::new()));
     thread::spawn(move || {
+        // New devices are seen through inotify on /dev/input; a slow rescan
+        // (every 10 s) stays as a safety net, or every 1 s without inotify.
+        let ifd = unsafe {
+            let fd = libc::inotify_init1(libc::IN_CLOEXEC);
+            if fd >= 0 {
+                let dir = std::ffi::CString::new("/dev/input").unwrap();
+                if libc::inotify_add_watch(fd, dir.as_ptr(), libc::IN_CREATE | libc::IN_ATTRIB) < 0 {
+                    libc::close(fd);
+                    -1
+                } else {
+                    fd
+                }
+            } else {
+                -1
+            }
+        };
+        if ifd < 0 {
+            warn!("inotify unavailable, rescanning /dev/input every second");
+        }
         loop {
             if let Ok(input_dir) = std::fs::read_dir("/dev/input") {
                 for entry in input_dir.flatten() {
@@ -1157,7 +1196,18 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            thread::sleep(Duration::from_secs(1));
+            if ifd >= 0 {
+                let mut pfd = libc::pollfd { fd: ifd, events: libc::POLLIN, revents: 0 };
+                let ready = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+                if ready > 0 {
+                    let mut buf = [0u8; 4096];
+                    unsafe { libc::read(ifd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                    // Let udev finish setting up the new node before opening it.
+                    thread::sleep(Duration::from_millis(150));
+                }
+            } else {
+                thread::sleep(Duration::from_secs(1));
+            }
         }
     });
 
@@ -1215,6 +1265,8 @@ fn main() -> Result<()> {
     let mut pending_recenter = false;
     // Per-playback statistics, logged when it stops.
     let mut axis_overrides: u64 = 0;
+    let mut last_reassert: HashMap<u16, Instant> = HashMap::new();
+    let mut reassert_due: HashMap<u16, Instant> = HashMap::new();
     let mut injected_count: u64 = 0;
     let mut playback_started = Instant::now();
 
@@ -1283,15 +1335,38 @@ fn main() -> Result<()> {
             }
         }
 
-        let timeout = if is_replaying && replay_index < recorded_events.len() {
-            let next_event = &recorded_events[replay_index];
-            let target_time = replay_start_time + scaled_delay(next_event.delay_ms, speed);
+        // Wake up only for something due; with nothing pending, block until an
+        // input or a signal arrives (no periodic wake-ups while idle).
+        let timeout = {
             let now = Instant::now();
-            if target_time > now { Some(target_time - now) } else { Some(Duration::from_secs(0)) }
-        } else {
-            Some(Duration::from_millis(50))
+            let mut due: Vec<Instant> = Vec::new();
+            if is_replaying {
+                match recorded_events.get(replay_index) {
+                    Some(next) => due.push(replay_start_time + scaled_delay(next.delay_ms, speed)),
+                    None => due.push(now), // loop restart or end of playback
+                }
+            }
+            if picker.is_some() {
+                due.push(now + Duration::from_millis(16)); // poll the grabbed gamepad
+            }
+            for (held, triggered, mode, t) in [
+                (record_held_since, record_triggered_this_press, config.record_trigger_mode, Trigger::Record),
+                (replay_held_since, replay_triggered_this_press, config.replay_trigger_mode, Trigger::Replay),
+                (picker_held_since, picker_triggered_this_press, config.picker_trigger_mode, Trigger::Picker),
+            ] {
+                if let (Some(h), false, TriggerMode::Hold) = (held, triggered, mode) {
+                    due.push(h + config.hold(t));
+                }
+            }
+            if trigger_status.is_none() || devices_changed {
+                due.push(started_at + Duration::from_secs(3));
+            }
+            due.extend(reassert_due.values().copied());
+            if pending_reload || pending_recenter || force_replay || terminating {
+                due.push(now + Duration::from_millis(if pending_reload { 50 } else { 0 }));
+            }
+            due.into_iter().min().map(|d| d.saturating_duration_since(now))
         };
-        let timeout = if picker.is_some() { timeout.map(|t| t.min(Duration::from_millis(16))) } else { timeout };
 
         let msg = if let Some(t) = timeout { rx.recv_timeout(t).ok() } else { rx.recv().ok() };
         let now = Instant::now();
@@ -1430,22 +1505,28 @@ fn main() -> Result<()> {
                 }
                 None
             }
-            None => None,
+            Some(Msg::Wake) | None => None,
         };
 
         if let Some((device_path, event)) = input {
             let kind = event.kind();
             let value = event.value();
 
-            let key_tuple = (device_path.clone(), event.event_type().0, event.code(), value);
-            if let Some((count, at, sent_at)) = ignore_injected.get_mut(&key_tuple) {
+            let key_tuple = if ignore_injected.is_empty() {
+                None
+            } else {
+                Some((device_path.clone(), event.event_type().0, event.code(), value))
+            };
+            if let Some((count, at, sent_at)) = key_tuple.as_ref().and_then(|k| ignore_injected.get_mut(k)) {
                 if *count > 0 && now.duration_since(*at) < ECHO_TTL && is_echo(event.timestamp(), *sent_at) {
                     *count -= 1;
                     continue;
                 }
                 if now.duration_since(*at) >= ECHO_TTL {
                     // Stale: the echo never came.
-                    ignore_injected.remove(&key_tuple);
+                    if let Some(k) = key_tuple.as_ref() {
+                        ignore_injected.remove(k);
+                    }
                 }
                 // Otherwise: a real event made before the injection; handle it.
             }
@@ -1563,9 +1644,18 @@ fn main() -> Result<()> {
                 if let Some((code, _)) = analog {
                     if let Some(&held) = injected_state.get(&(EV_ABS, code)) {
                         if value != held {
-                            if inject(&mut write_devices, &mut ignore_injected, &device_path, EV_ABS, code, held) {
-                                axis_overrides += 1;
+                            let next_ok = last_reassert.get(&code).map_or(now, |t| *t + REASSERT_MIN_INTERVAL);
+                            if now >= next_ok {
+                                if inject(&mut write_devices, &mut ignore_injected, &device_path, EV_ABS, code, held) {
+                                    axis_overrides += 1;
+                                    last_reassert.insert(code, now);
+                                }
+                            } else {
+                                // Too soon: re-assert once the interval is over.
+                                reassert_due.insert(code, next_ok);
                             }
+                        } else {
+                            reassert_due.remove(&code);
                         }
                     }
                 }
@@ -1669,6 +1759,24 @@ fn main() -> Result<()> {
                 fire
             }
         };
+        // Deferred stick re-asserts (see REASSERT_MIN_INTERVAL).
+        if !reassert_due.is_empty() {
+            if is_replaying {
+                let ready: Vec<u16> = reassert_due.iter().filter(|(_, d)| **d <= now).map(|(c, _)| *c).collect();
+                for code in ready {
+                    reassert_due.remove(&code);
+                    if let (Some(&held), Some(dev)) = (injected_state.get(&(EV_ABS, code)), last_active_device.clone()) {
+                        if inject(&mut write_devices, &mut ignore_injected, &dev, EV_ABS, code, held) {
+                            axis_overrides += 1;
+                            last_reassert.insert(code, Instant::now());
+                        }
+                    }
+                }
+            } else {
+                reassert_due.clear();
+            }
+        }
+
         if picker_fire && state == State::Idle {
             if let Some(p) = picker.take() {
                 picker_open_flag.store(false, Ordering::Relaxed);
@@ -1787,6 +1895,8 @@ fn main() -> Result<()> {
                 }
             }
             injected_state.clear();
+            reassert_due.clear();
+            last_reassert.clear();
             info!(
                 "Playback stats: {} iteration(s), {} events injected, {} stick re-asserts, {:.1}s; released {} held input(s) in {} ms.",
                 current_iteration + 1,

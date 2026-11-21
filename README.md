@@ -34,6 +34,7 @@ The same URL always points to the latest release, so re-installing from it updat
 - **Slots at a glance:** the slot list shows whether each slot is empty and how long its macro lasts; *Preview macro* lists its events (time, input, action). Each slot also has a playback speed (0.5x to 2x).
 - **Player takes over:** during playback, pushing a stick past 25% stops the macro from re-asserting that axis; past 50% (or a button) cancels when *Cancel on input* is on.
 - **Diagnostic** view (version, triggers, last daemon log lines) and **French / English** interface (*Language* in Settings, *Auto* follows Steam).
+- **Low idle cost:** the daemon sleeps until an input, a signal or a deadline (hold timer, next macro event) instead of waking every 50 ms; new devices are seen through inotify on `/dev/input` (rescan every 10 s as a safety net); stick re-asserts are limited to one per 4 ms per axis; the picker overlay process is started in advance and only creates its window while the menu is shown.
 - **Hot reload:** changing the active slot or the settings no longer restarts the daemon: the plugin writes `active_slot.json` / `config.json` and sends SIGHUP; the daemon applies them once idle (never mid-recording or mid-playback). SIGTERM stops it cleanly: held inputs are released and a recording in progress is saved.
 - **Remembers *Enable Decky Macro*:** the daemon starts again after a reboot if it was enabled.
 - **System keys ignored:** volume, mute, power and brightness keys never cancel a playback and are never recorded.

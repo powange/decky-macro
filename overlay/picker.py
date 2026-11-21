@@ -316,17 +316,31 @@ FONT_MONO = b"sans-serif"
 MAX_ROWS = 8
 
 
+def close_window(overlay):
+    """Blank, unmap and destroy the window, so gamescope shows the other
+    overlays again (it composites a single external overlay at a time)."""
+    overlay.render(None)
+    XUnmapWindow(overlay.dpy, overlay.win)
+    XDestroyWindow(overlay.dpy, overlay.win)
+    XSync(overlay.dpy, 0)
+    XCloseDisplay(overlay.dpy)
+    sys.stderr.write("picker: window destroyed\n")
+
+
 def main():
-    overlay = Overlay()
+    # The process is started in advance (Python start-up is the slow part);
+    # the window only exists while a menu is shown.
+    overlay = None
     menu = None
     buf = b""
     last_key = None
     stdin_fd = sys.stdin.fileno()
     os.set_blocking(stdin_fd, False)
-    overlay.render(None)
+    sys.stderr.write("picker: ready\n")
 
     while True:
-        readable, _, _ = select.select([stdin_fd, overlay.fd], [], [], 0.5)
+        fds = [stdin_fd] + ([overlay.fd] if overlay else [])
+        readable, _, _ = select.select(fds, [], [], None if overlay is None else 0.5)
         if stdin_fd in readable:
             try:
                 chunk = os.read(stdin_fd, 65536)
@@ -344,25 +358,28 @@ def main():
                         continue
                     try:
                         menu = json.loads(line).get("menu")
-                        sys.stderr.write("picker: hide\n" if menu is None else "")
                     except (ValueError, AttributeError):
                         sys.stderr.write(f"picker: bad message {line[:200]!r}\n")
-        if overlay.fd in readable:
+        if overlay is not None and overlay.fd in readable:
             overlay.drain_events()
 
+        if menu is None:
+            if overlay is not None:
+                close_window(overlay)
+                overlay = None
+                sys.stderr.write("picker: hide\n")
+            last_key = None
+            continue
+        if overlay is None:
+            overlay = Overlay()
+            sys.stderr.write("picker: show\n")
         key = json.dumps(menu, sort_keys=True)
         if key != last_key:
             overlay.render(menu)
             last_key = key
 
-    # Leave a transparent frame and remove the window explicitly, so gamescope
-    # can't keep showing the last menu frame after we exit.
-    overlay.render(None)
-    XUnmapWindow(overlay.dpy, overlay.win)
-    XDestroyWindow(overlay.dpy, overlay.win)
-    XSync(overlay.dpy, 0)
-    XCloseDisplay(overlay.dpy)
-    sys.stderr.write("picker: window destroyed\n")
+    if overlay is not None:
+        close_window(overlay)
 
 
 if __name__ == "__main__":
