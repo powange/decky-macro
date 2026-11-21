@@ -147,7 +147,6 @@ class Plugin:
                             notify("Macro picker: cannot read the gamepad", error=True)
                         
             threading.Thread(target=log_output, args=(Plugin.process.stdout,), daemon=True).start()
-            self._start_overlay()
             return True
         except Exception as e:
             decky_plugin.logger.error(f"Failed to start daemon: {e}\n{traceback.format_exc()}")
@@ -175,14 +174,12 @@ class Plugin:
         return path
 
     def _start_overlay(self):
-        """Starts the in-game picker overlay when a picker trigger is set."""
+        """Starts the in-game picker overlay window.
+
+        gamescope composites a single GAMESCOPE_EXTERNAL_OVERLAY window at a
+        time, so the overlay only exists while the picker menu is shown;
+        otherwise it would hide other plugins' overlays (e.g. Decky Timer)."""
         self._stop_overlay()
-        try:
-            with open(self.config_path, "r") as f:
-                if not json.load(f).get("trigger_picker_code"):
-                    return
-        except Exception:
-            return
         python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else shutil.which("python3")
         script = os.path.join(decky_plugin.DECKY_PLUGIN_DIR, "overlay", "picker.py")
         if not python or not os.path.exists(script):
@@ -216,10 +213,16 @@ class Plugin:
             decky_plugin.logger.error(f"Picker overlay: start failed: {e}")
 
     def _overlay_send(self, message):
+        if message.get("menu") is None:
+            # Menu closed: remove the overlay window entirely.
+            self._stop_overlay()
+            return
         proc = getattr(self, "overlay", None)
         if proc is None or proc.poll() is not None:
-            if message.get("menu") is not None:
-                self.notifications.append({"message": "Macro picker overlay is not running (see picker-overlay.log)", "error": True})
+            self._start_overlay()
+            proc = getattr(self, "overlay", None)
+        if proc is None or proc.poll() is not None:
+            self.notifications.append({"message": "Macro picker overlay could not start (see picker-overlay.log)", "error": True})
             return
         try:
             proc.stdin.write((json.dumps(message) + "\n").encode())
