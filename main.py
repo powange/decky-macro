@@ -8,6 +8,7 @@ import traceback
 import pwd
 import shutil
 import time
+import signal
 import decky_plugin
 
 # Environment variables set by Decky's bundled (PyInstaller) python that would
@@ -70,6 +71,34 @@ class Plugin:
         with open(self.data_path, "r") as f:
             return json.load(f)
 
+    def _write_slot_file(self, data) -> str:
+        """Settings of the active slot, read by the daemon at start and on SIGHUP."""
+        active_slot = str(data.get("active_slot", "0"))
+        sc = data.get("slots", {}).get(active_slot, {})
+        path = os.path.join(self.config_dir, "active_slot.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "macro_file": os.path.join(self.config_dir, f"macro_{active_slot}.json"),
+                "loops": int(sc.get("loops", 0)),
+                "cancel_on_input": bool(sc.get("cancel_on_input", True)),
+                "record_analog": bool(sc.get("record_analog", True)),
+                "cardinal_only": bool(sc.get("cardinal_only", False)),
+            }, f)
+        os.replace(tmp, path)
+        return path
+
+    def _reload_daemon(self):
+        """Makes a running daemon re-read its config and active slot (SIGHUP).
+        It applies the change once idle, so a recording or a playback in progress
+        is never lost (instead of the old restart)."""
+        data = self._get_data()
+        self._write_slot_file(data)
+        self._write_picker_file(data)
+        if Plugin.process is not None and Plugin.process.poll() is None:
+            Plugin.process.send_signal(signal.SIGHUP)
+            decky_plugin.logger.info("Daemon asked to reload its settings")
+
     def start_daemon(self) -> bool:
         self.stop_daemon()
         if not os.path.exists(self.bin_path):
@@ -87,6 +116,7 @@ class Plugin:
             cardinal_only = "true" if slot_config.get("cardinal_only", False) else "false"
             macro_file = os.path.join(self.config_dir, f"macro_{active_slot}.json")
             picker_file = self._write_picker_file(data)
+            slot_file = self._write_slot_file(data)
 
             decky_plugin.logger.info(f"Starting decky-macro-daemon daemon for slot {active_slot}...")
             Plugin.process = subprocess.Popen(
@@ -99,26 +129,38 @@ class Plugin:
                     "--record-analog", record_analog,
                     "--cardinal-only", cardinal_only,
                     "--picker-file", picker_file,
+                    "--slot-file", slot_file,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT
             )
             
             def log_output(pipe):
-                def notify(message, error=False):
-                    self.notifications.append({"message": message, "error": error})
-
                 with pipe:
                     for line in iter(pipe.readline, b''):
+                        # Never let one bad line kill this thread: if nobody reads
+                        # the pipe, the daemon blocks on its next log write.
+                        try:
+                            handle_line(line)
+                        except Exception as e:
+                            try:
+                                decky_plugin.logger.error(f"Daemon log handling failed: {e}")
+                            except Exception:
+                                pass
+
+            def notify(message, error=False):
+                self.notifications.append({"message": message, "error": error})
+
+            def handle_line(line):
                         line_str = line.decode('utf-8', errors='replace').strip()
 
                         # Picker menu messages go to the overlay, not the log.
                         if line_str.startswith("PICKER_SHOW "):
                             self._overlay_send({"menu": json.loads(line_str[len("PICKER_SHOW "):])})
-                            continue
+                            return
                         if line_str == "PICKER_HIDE":
                             self._overlay_send({"menu": None})
-                            continue
+                            return
                         decky_plugin.logger.info(f"[Rust] {line_str}")
 
                         if "Started recording to" in line_str:
@@ -141,6 +183,12 @@ class Plugin:
                             notify("Record button is not seen by the daemon - pick another one", error=True)
                         elif "Trigger not available: replay" in line_str:
                             notify("Replay button is not seen by the daemon - pick another one", error=True)
+                        elif "Trigger not available: picker" in line_str:
+                            notify("Picker button is not seen by the daemon - pick another one", error=True)
+                        elif "Trigger available again" in line_str:
+                            notify("Trigger button detected again")
+                        elif "Macro size limit reached" in line_str:
+                            notify("Macro size limit reached - recording saved", error=True)
                         elif "Picker: no recorded macro" in line_str:
                             notify("No recorded macro to choose from", error=True)
                         elif "Picker: cannot open gamepad" in line_str:
@@ -253,8 +301,15 @@ class Plugin:
         self._stop_overlay()
         if Plugin.process:
             decky_plugin.logger.info("Stopping decky-macro-daemon daemon...")
+            # SIGTERM: the daemon releases held inputs and saves a recording
+            # in progress, then exits; kill it if it takes too long.
             Plugin.process.terminate()
-            Plugin.process.wait()
+            try:
+                Plugin.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                decky_plugin.logger.warning("Daemon did not stop in 3 s, killing it")
+                Plugin.process.kill()
+                Plugin.process.wait(timeout=2)
             Plugin.process = None
 
     async def detect_trigger(self, which: str) -> dict:
@@ -320,20 +375,23 @@ class Plugin:
         return config
 
     async def save_config(self, config: dict) -> bool:
-        # Trigger/replay/hold settings are only read by the daemon at startup, so
-        # the UI restricts editing them to when the daemon is stopped. We no longer
-        # signal a running daemon here to reload (that behaviour was removed).
         # `daemon_enabled` is owned by set_daemon_state: keep the stored value so
-        # a stale copy from the UI can't overwrite it.
+        # a stale copy from the UI can't overwrite it. A running daemon reloads
+        # the new settings (SIGHUP) once it is idle.
         config = dict(config)
         config["daemon_enabled"] = (await self.get_config()).get("daemon_enabled", False)
-        return self._write_config(config)
+        ok = self._write_config(config)
+        if ok:
+            self._reload_daemon()
+        return ok
 
     def _write_config(self, config: dict) -> bool:
         try:
-            with open(self.config_path, "w") as f:
+            tmp = self.config_path + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(config, f, indent=4)
-            decky_plugin.logger.info("Config saved. Trigger/hold changes apply on next daemon start.")
+            os.replace(tmp, self.config_path)
+            decky_plugin.logger.info("Config saved.")
             return True
         except Exception as e:
             decky_plugin.logger.error(f"Failed to save config to {self.config_path}: {e}\n{traceback.format_exc()}")
@@ -344,10 +402,21 @@ class Plugin:
 
     async def save_slots_data(self, data: dict) -> bool:
         try:
-            with open(self.data_path, "w") as f:
+            # Delete the macro of removed slots, so a new slot reusing the id
+            # doesn't inherit it.
+            old_ids = set(self._get_data().get("slots", {}).keys())
+            new_ids = set(data.get("slots", {}).keys())
+            for sid in old_ids - new_ids:
+                macro = os.path.join(self.config_dir, f"macro_{sid}.json")
+                if os.path.exists(macro):
+                    os.remove(macro)
+                    decky_plugin.logger.info(f"Deleted macro of removed slot {sid}")
+            tmp = self.data_path + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=4)
-            if await self.get_daemon_state():
-                self.start_daemon()
+            os.replace(tmp, self.data_path)
+            # The daemon picks the change up without a restart (no lost recording).
+            self._reload_daemon()
             return True
         except Exception as e:
             decky_plugin.logger.error(f"Failed to save slots data to {self.data_path}: {e}\n{traceback.format_exc()}")
@@ -358,11 +427,14 @@ class Plugin:
         return Plugin.process.poll() is None
 
     async def set_daemon_state(self, is_running: bool) -> bool:
+        # Run in a worker thread: stopping waits for the daemon to clean up,
+        # which must not block Decky's event loop.
+        loop = asyncio.get_running_loop()
         if is_running:
-            if not self.start_daemon():
+            if not await loop.run_in_executor(None, self.start_daemon):
                 raise Exception("Failed to start Decky Macro daemon. Check logs for details.")
         else:
-            self.stop_daemon()
+            await loop.run_in_executor(None, self.stop_daemon)
         # Remember the choice so the daemon comes back after a reboot.
         config = await self.get_config()
         if config.get("daemon_enabled") != is_running:

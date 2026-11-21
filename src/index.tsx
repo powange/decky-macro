@@ -39,6 +39,18 @@ const withCustom = (code: number, label?: string) =>
 // Releases of this fork are published by .github/workflows/release.yml.
 const UPDATE_REPO = "powange/decky-macro";
 const UPDATE_ASSET = "decky-macro.zip";
+
+// Compares "1.6.4-analog" style versions numerically (suffix ignored):
+// > 0 when a is newer than b.
+const compareVersions = (a: string, b: string) => {
+  const parts = (v: string) => v.replace(/^v/, "").split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+  const pa = parts(a), pb = parts(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa.at(i) ?? 0) - (pb.at(i) ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
 // Must match "name" in plugin.json so Decky replaces the installed plugin.
 const PLUGIN_NAME = "Decky Macro";
 // Decky's PluginInstallType.UPDATE
@@ -66,8 +78,8 @@ function UpdateSection() {
       const rel = await res.json();
       const asset = (rel.assets || []).find((a: any) => a.name === UPDATE_ASSET);
       if (!asset) throw new Error(`no ${UPDATE_ASSET} in the latest release`);
-      if (rel.tag_name === `v${current}`) {
-        setStatus(`Up to date (${rel.tag_name})`);
+      if (compareVersions(rel.tag_name, current) <= 0) {
+        setStatus(`Up to date (${current})`);
       } else {
         setLatest({ tag: rel.tag_name, url: asset.browser_download_url });
         setStatus(`Update available: ${rel.tag_name}`);
@@ -83,7 +95,7 @@ function UpdateSection() {
     if (!latest) return;
     const backend = (window as any).DeckyBackend;
     if (!backend?.call) {
-      setStatus("Decky install API not available - install from URL instead");
+      setStatus(`Decky install API not available. Install from URL: https://github.com/${UPDATE_REPO}/releases/latest/download/${UPDATE_ASSET}`);
       return;
     }
     // Opens Decky's own install confirmation, like the store does.
@@ -150,7 +162,7 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
     <ConfirmModal 
       onCancel={closeModal} 
       onOK={() => {
-        const newData = { ...slotsData };
+        const newData = { ...slotsData, slots: { ...slotsData.slots } };
         newData.slots[slotId] = {
           name: name || "Unnamed Slot",
           loops,
@@ -208,7 +220,7 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
   );
 };
 
-const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
+const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any) => {
   const [recordCode, setRecordCode] = useState(initialConfig?.trigger_record_code ?? 317);
   const [replayCode, setReplayCode] = useState(initialConfig?.trigger_replay_code ?? 318);
   const holdMs = initialConfig?.hold_duration_ms ?? 500;
@@ -335,7 +347,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
     >
       <div style={{ padding: "0 0 20px 0" }}>
         <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "12px", lineHeight: "1.3" }}>
-          These settings are read when the daemon starts. Stop the daemon before changing them.
+          Changes apply right away, or as soon as the current recording or playback ends.
           Back buttons (L4/L5/R4/R5) are read directly from the Deck controller, so they can be picked from the list or detected. Detect: press it, then press the button within 10 seconds (touches, A and B are ignored).
         </div>
 
@@ -345,8 +357,8 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
           selectedOption={recordCode}
           onChange={(opt: any) => setRecordCode(opt.data)}
         />
-        <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("record")}>
-          {detecting === "record" ? "Press the button now (10 s)..." : "Detect record button"}
+        <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("record")}>
+          {detecting === "record" ? "Press the button now (10 s)..." : daemonRunning ? "Detect: stop the daemon first" : "Detect record button"}
         </ButtonItem>
         {triggerMode(recordMode, setRecordMode, recordCount, setRecordCount, recordHold, setRecordHold, recordWindow, setRecordWindow)}
 
@@ -356,8 +368,8 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
           selectedOption={replayCode}
           onChange={(opt: any) => setReplayCode(opt.data)}
         />
-        <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("replay")}>
-          {detecting === "replay" ? "Press the button now (10 s)..." : "Detect replay button"}
+        <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("replay")}>
+          {detecting === "replay" ? "Press the button now (10 s)..." : daemonRunning ? "Detect: stop the daemon first" : "Detect replay button"}
         </ButtonItem>
         {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount, replayHold, setReplayHold, replayWindow, setReplayWindow)}
 
@@ -372,8 +384,8 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
         />
         {pickerCode !== 0 && (
           <>
-            <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("picker")}>
-              {detecting === "picker" ? "Press the button now (10 s)..." : "Detect picker button"}
+            <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("picker")}>
+              {detecting === "picker" ? "Press the button now (10 s)..." : daemonRunning ? "Detect: stop the daemon first" : "Detect picker button"}
             </ButtonItem>
             {triggerMode(pickerMode, setPickerMode, pickerCount, setPickerCount, pickerHold, setPickerHold, pickerWindow, setPickerWindow)}
           </>
@@ -480,7 +492,7 @@ function Content() {
         strTitle="Delete Slot?" 
         strDescription="Are you sure you want to delete this macro slot?"
         onOK={() => {
-          const newData = { ...slotsData };
+          const newData = { ...slotsData, slots: { ...slotsData.slots } };
           delete newData.slots[activeId];
           newData.active_slot = "0"; // Default back to slot 0
           updateSlots(newData);
@@ -495,6 +507,7 @@ function Content() {
       <SettingsModal
         initialConfig={globalConfig}
         onSave={setGlobal}
+        daemonRunning={isDaemonRunning}
       />
     );
   };
@@ -546,16 +559,10 @@ function Content() {
           <ButtonItem
             layout="below"
             onClick={openSettings}
-            disabled={isDaemonRunning}
           >
             Settings
           </ButtonItem>
         </PanelSectionRow>
-        {isDaemonRunning && (
-          <div style={{ padding: "5px 10px 0 10px", fontSize: "11px", color: "#ffcc00", lineHeight: "1.3" }}>
-            Stop the daemon to change trigger settings.
-          </div>
-        )}
       </PanelSection>
 
       <PanelSection title="Active Macro Slot">

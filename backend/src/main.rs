@@ -359,7 +359,45 @@ fn save_macro(path: &Path, events: &Vec<MacroEvent>) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_string(&compressed) {
-        let _ = fs::write(path, json);
+        // Write to a temp file then rename (atomic): an interrupted write can't
+        // leave a truncated macro behind.
+        let tmp = path.with_extension("json.tmp");
+        match fs::write(&tmp, json).and_then(|_| fs::rename(&tmp, path)) {
+            Ok(()) => {}
+            Err(e) => error!("Could not save macro {:?}: {}", path, e),
+        }
+    }
+}
+
+/// Settings of the active slot, written by the plugin backend. Re-read on
+/// SIGHUP so switching slots doesn't need a daemon restart.
+#[derive(Deserialize, Debug, Clone)]
+struct SlotSettings {
+    macro_file: String,
+    #[serde(default)]
+    loops: i32,
+    #[serde(default = "default_true")]
+    cancel_on_input: bool,
+    #[serde(default = "default_true")]
+    record_analog: bool,
+    #[serde(default)]
+    cardinal_only: bool,
+}
+
+fn load_slot_settings(path: &str) -> Option<SlotSettings> {
+    if path.is_empty() {
+        return None;
+    }
+    match fs::read_to_string(path).map(|d| serde_json::from_str::<SlotSettings>(&d)) {
+        Ok(Ok(s)) => Some(s),
+        Ok(Err(e)) => {
+            error!("Slot file {:?} is not valid: {}", path, e);
+            None
+        }
+        Err(e) => {
+            error!("Cannot read slot file {:?}: {}", path, e);
+            None
+        }
     }
 }
 
@@ -469,7 +507,19 @@ impl AnalogRecorder {
     }
 }
 
-type EchoMap = HashMap<(PathBuf, u16, u16, i32), (usize, Instant)>;
+/// Pending echoes of injected events: count, when injected (monotonic), and
+/// the wall-clock time of the injection (comparable with kernel event times).
+type EchoMap = HashMap<(PathBuf, u16, u16, i32), (usize, Instant, std::time::SystemTime)>;
+
+/// An event is the echo of an injection only if it was stamped by the kernel
+/// at or after the injection (2 ms tolerance). A real press made just before
+/// the injection, with the same value, is therefore not swallowed.
+fn is_echo(event_time: std::time::SystemTime, injected_at: std::time::SystemTime) -> bool {
+    match injected_at.duration_since(event_time) {
+        Ok(earlier_by) => earlier_by <= Duration::from_millis(2),
+        Err(_) => true, // event stamped after the injection
+    }
+}
 
 /// Injects one event (+ SYN) into `device_path`, registering it for echo cancellation.
 fn inject(
@@ -491,6 +541,7 @@ fn inject(
     }
     let injection = InputEvent::new(evdev::EventType(t), c, v);
     let sync = InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0);
+    let sent_at = std::time::SystemTime::now();
     let mut sent = write_devices.get_mut(device_path).unwrap().send_events(&[injection, sync]).is_ok();
     if !sent {
         // The cached handle may point to a device that was removed and
@@ -502,9 +553,12 @@ fn inject(
         }
     }
     if sent {
-        let e = ignore_injected.entry((device_path.clone(), t, c, v)).or_insert((0, Instant::now()));
+        let e = ignore_injected
+            .entry((device_path.clone(), t, c, v))
+            .or_insert((0, Instant::now(), std::time::SystemTime::now()));
         e.0 += 1;
         e.1 = Instant::now();
+        e.2 = sent_at;
         true
     } else {
         error!("Injection into {:?} failed", device_path);
@@ -841,8 +895,9 @@ enum Msg {
         is_gamepad: bool,
         /// Ranges of its analog axes (gamepads only).
         ranges: Vec<(u16, AxisRange)>,
-        has_record_key: bool,
-        has_replay_key: bool,
+        /// Keys the device can report (trigger availability is checked against
+        /// the current config, so a reload or a hot-plug is handled too).
+        keys: Vec<u16>,
     },
     Input(PathBuf, InputEvent),
     /// A device disappeared (its reader stopped).
@@ -869,6 +924,7 @@ fn main() -> Result<()> {
     let mut loops: i32 = 0;
     let mut cancel_on_input = true;
     let mut picker_file = String::new();
+    let mut slot_file = String::new();
     let mut record_analog = true;
     let mut cardinal_only = false;
 
@@ -882,16 +938,30 @@ fn main() -> Result<()> {
             "--record-analog" => { record_analog = args[i + 1] == "true"; i += 2; }
             "--cardinal-only" => { cardinal_only = args[i + 1] == "true"; i += 2; }
             "--picker-file" => { picker_file = args[i + 1].clone(); i += 2; }
+            "--slot-file" => { slot_file = args[i + 1].clone(); i += 2; }
             _ => i += 1,
         }
     }
 
+    if let Some(slot) = load_slot_settings(&slot_file) {
+        macro_file = slot.macro_file;
+        loops = slot.loops;
+        cancel_on_input = slot.cancel_on_input;
+        record_analog = slot.record_analog;
+        cardinal_only = slot.cardinal_only;
+    }
+
     let mut config = load_or_create_config(&config_path);
-    let active_macro_path = PathBuf::from(&macro_file);
+    let mut active_macro_path = PathBuf::from(&macro_file);
     let mut recorded_events = load_macro(&active_macro_path);
 
+    // SIGHUP: reload config + active slot (applied once idle).
+    // SIGTERM: stop cleanly (release held inputs, save a recording in progress).
     let reload_config = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload_config))?;
+    let terminate = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&terminate))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&terminate))?;
 
     info!("Loaded active slot: {:?}", active_macro_path);
     info!("Loops: {}, Cancel: {}, Record analog: {}, 4 directions: {}", loops, cancel_on_input, record_analog, cardinal_only);
@@ -912,7 +982,6 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
     let tx_discovery = tx.clone();
-    let (record_code, replay_code) = (config.trigger_record_code, config.trigger_replay_code);
 
     let tx_paddles = tx.clone();
     let paddle_path = PathBuf::from(DECK_PADDLES_PATH);
@@ -928,8 +997,7 @@ fn main() -> Result<()> {
             name: "Steam Deck back buttons".to_string(),
             is_gamepad: false,
             ranges: Vec::new(),
-            has_record_key: is_paddle_code(record_code),
-            has_replay_key: is_paddle_code(replay_code),
+            keys: DECK_PADDLES.iter().map(|(c, _, _)| *c).collect(),
         });
     }
 
@@ -979,25 +1047,16 @@ fn main() -> Result<()> {
                                         ranges
                                     );
                                 }
-                                let keys = device.supported_keys();
-                                let has_record_key = keys.map_or(false, |k| k.contains(Key::new(record_code)));
-                                let has_replay_key = keys.map_or(false, |k| k.contains(Key::new(replay_code)));
-                                if has_record_key || has_replay_key {
-                                    info!(
-                                        "{:?} ({}) reports trigger key(s):{}{}",
-                                        path,
-                                        device.name().unwrap_or("?"),
-                                        if has_record_key { " record" } else { "" },
-                                        if has_replay_key { " replay" } else { "" }
-                                    );
-                                }
+                                let keys: Vec<u16> = device
+                                    .supported_keys()
+                                    .map(|k| k.iter().map(|key| key.code()).collect())
+                                    .unwrap_or_default();
                                 let _ = tx_discovery.send(Msg::Device {
                                     path: path.clone(),
                                     name: device.name().unwrap_or("?").to_string(),
                                     is_gamepad,
                                     ranges,
-                                    has_record_key,
-                                    has_replay_key,
+                                    keys,
                                 });
 
                                 let tx_inner = tx_discovery.clone();
@@ -1079,8 +1138,10 @@ fn main() -> Result<()> {
     let mut last_gamepad: Option<PathBuf> = None;
     let mut device_names: HashMap<PathBuf, String> = HashMap::new();
     let started_at = Instant::now();
-    let mut trigger_check_done = false;
-    let (mut seen_record_key, mut seen_replay_key) = (false, false);
+    // Keys each device reports, to check that the configured triggers exist.
+    let mut device_keys: HashMap<PathBuf, HashSet<u16>> = HashMap::new();
+    let mut devices_changed = false;
+    let mut trigger_status: Option<(bool, bool, bool)> = None;
     let mut last_active_device: Option<PathBuf> = None;
 
     // Analog bookkeeping.
@@ -1103,12 +1164,62 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| AxisRange::fallback(code))
     };
 
+    let mut pending_reload = false;
+    let mut terminating = false;
+
     loop {
         if reload_config.swap(false, Ordering::Relaxed) {
-            info!("SIGHUP received, reloading global config from {:?}", config_path);
+            info!("SIGHUP received, reload pending");
+            pending_reload = true;
+        }
+        // Apply a reload only when nothing is in progress (never mid-recording,
+        // mid-playback or with the picker open).
+        if pending_reload && state == State::Idle && !is_replaying && !pending_recenter && picker.is_none() && picker_restore.is_none() {
+            pending_reload = false;
             config = load_or_create_config(&config_path);
-            info!("Reloaded config: record={}, replay={}, hold={}ms",
-                config.trigger_record_code, config.trigger_replay_code, config.hold_duration_ms);
+            if let Some(slot) = load_slot_settings(&slot_file) {
+                active_macro_path = PathBuf::from(&slot.macro_file);
+                recorded_events = load_macro(&active_macro_path);
+                loops = slot.loops;
+                cancel_on_input = slot.cancel_on_input;
+                record_analog = slot.record_analog;
+                cardinal_only = slot.cardinal_only;
+                analog_recorder = AnalogRecorder::new(cardinal_only);
+            }
+            record_held_since = None;
+            replay_held_since = None;
+            picker_held_since = None;
+            record_presses = PressCounter::default();
+            replay_presses = PressCounter::default();
+            picker_presses = PressCounter::default();
+            devices_changed = true; // re-check trigger availability
+            info!(
+                "Reloaded: slot {:?} ({} events), loops {}, cancel {}, analog {}, 4 directions {}",
+                active_macro_path, recorded_events.len(), loops, cancel_on_input, record_analog, cardinal_only
+            );
+        }
+
+        if terminate.load(Ordering::Relaxed) && !terminating {
+            terminating = true;
+            info!("Stop requested, cleaning up");
+            if let Some(p) = picker.take() {
+                picker_open_flag.store(false, Ordering::Relaxed);
+                p.close();
+            }
+            if state == State::Recording {
+                state = State::Idle;
+                let elapsed = record_start_time.elapsed();
+                let tail = analog_recorder.finish(elapsed, |c| range_for(&axis_ranges, &last_active_device, c));
+                recorded_events.extend(tail);
+                if !recorded_events.is_empty() {
+                    save_macro(&active_macro_path, &recorded_events);
+                    info!("Stopped recording. Saved {} events.", recorded_events.len());
+                }
+            }
+            if is_replaying || !injected_state.is_empty() {
+                is_replaying = false;
+                pending_recenter = true;
+            }
         }
 
         let timeout = if is_replaying && replay_index < recorded_events.len() {
@@ -1183,24 +1294,39 @@ fn main() -> Result<()> {
         }
 
         if now.duration_since(last_echo_purge) >= Duration::from_secs(1) {
-            ignore_injected.retain(|_, (count, at)| *count > 0 && now.duration_since(*at) < ECHO_TTL);
+            ignore_injected.retain(|_, (count, at, _)| *count > 0 && now.duration_since(*at) < ECHO_TTL);
             last_echo_purge = now;
         }
 
-        // Warn once if the chosen trigger buttons are not reported by any device
-        // (e.g. back buttons hidden behind Steam's virtual gamepad).
-        if !trigger_check_done && now.duration_since(started_at) >= Duration::from_secs(3) {
-            trigger_check_done = true;
-            if !seen_record_key {
-                error!("Trigger not available: record button {} is not reported by any input device.", key_label(config.trigger_record_code));
-            }
-            if !seen_replay_key {
-                error!("Trigger not available: replay button {} is not reported by any input device.", key_label(config.trigger_replay_code));
+        // Check that the trigger buttons are reported by some device: 3 s after
+        // start, then whenever devices or the config change; only report changes.
+        if now.duration_since(started_at) >= Duration::from_secs(3) && (trigger_status.is_none() || devices_changed) {
+            devices_changed = false;
+            let has = |code: u16| device_keys.values().any(|k| k.contains(&code));
+            let status = (
+                has(config.trigger_record_code),
+                has(config.trigger_replay_code),
+                config.trigger_picker_code == 0 || has(config.trigger_picker_code),
+            );
+            if trigger_status != Some(status) {
+                let before = trigger_status.unwrap_or((true, true, true));
+                for (name, ok, was_ok, code) in [
+                    ("record", status.0, before.0, config.trigger_record_code),
+                    ("replay", status.1, before.1, config.trigger_replay_code),
+                    ("picker", status.2, before.2, config.trigger_picker_code),
+                ] {
+                    if !ok && (was_ok || trigger_status.is_none()) {
+                        error!("Trigger not available: {} button {} is not reported by any input device.", name, key_label(code));
+                    } else if ok && !was_ok {
+                        info!("Trigger available again: {} button {}", name, key_label(code));
+                    }
+                }
+                trigger_status = Some(status);
             }
         }
 
         let input = match msg {
-            Some(Msg::Device { path, name, is_gamepad, ranges, has_record_key, has_replay_key }) => {
+            Some(Msg::Device { path, name, is_gamepad, ranges, keys }) => {
                 for (code, range) in ranges {
                     axis_ranges.insert((path.clone(), code), range);
                 }
@@ -1209,10 +1335,10 @@ fn main() -> Result<()> {
                 write_devices.remove(&path);
                 if is_gamepad {
                     gamepads.insert(path.clone());
-                    last_gamepad = Some(path);
+                    last_gamepad = Some(path.clone());
                 }
-                seen_record_key |= has_record_key;
-                seen_replay_key |= has_replay_key;
+                device_keys.insert(path, keys.into_iter().collect());
+                devices_changed = true;
                 None
             }
             Some(Msg::Input(path, event))
@@ -1230,6 +1356,8 @@ fn main() -> Result<()> {
             }
             Some(Msg::Input(path, event)) => Some((path, event)),
             Some(Msg::Removed(path)) => {
+                device_keys.remove(&path);
+                devices_changed = true;
                 write_devices.remove(&path);
                 gamepads.remove(&path);
                 axis_ranges.retain(|(p, _), _| p != &path);
@@ -1249,13 +1377,16 @@ fn main() -> Result<()> {
             let value = event.value();
 
             let key_tuple = (device_path.clone(), event.event_type().0, event.code(), value);
-            if let Some((count, at)) = ignore_injected.get_mut(&key_tuple) {
-                if *count > 0 && now.duration_since(*at) < ECHO_TTL {
+            if let Some((count, at, sent_at)) = ignore_injected.get_mut(&key_tuple) {
+                if *count > 0 && now.duration_since(*at) < ECHO_TTL && is_echo(event.timestamp(), *sent_at) {
                     *count -= 1;
                     continue;
                 }
-                // Stale: the echo never came. Treat this event as physical input.
-                ignore_injected.remove(&key_tuple);
+                if now.duration_since(*at) >= ECHO_TTL {
+                    // Stale: the echo never came.
+                    ignore_injected.remove(&key_tuple);
+                }
+                // Otherwise: a real event made before the injection; handle it.
             }
 
             let analog = match kind {
@@ -1344,7 +1475,13 @@ fn main() -> Result<()> {
                 None => value != 0,
             };
             let is_system = matches!(kind, InputEventKind::Key(k) if is_system_key(k.code()));
-            if is_replaying && is_deliberate && !is_system && !is_record_btn && !is_replay_btn && !is_picker_btn && cancel_on_input {
+            // Only gamepads (and the Deck's back buttons) cancel a playback or get
+            // recorded: the touchscreen, trackpads and keyboards are ignored.
+            let from_paddles = device_path.as_os_str() == DECK_PADDLES_PATH;
+            let from_gamepad = gamepads.is_empty() || gamepads.contains(&device_path);
+            if is_replaying && is_deliberate && !is_system && !is_record_btn && !is_replay_btn && !is_picker_btn
+                && cancel_on_input && (from_gamepad || from_paddles)
+            {
                 let lag_ms = std::time::SystemTime::now()
                     .duration_since(event.timestamp())
                     .ok()
@@ -1374,8 +1511,7 @@ fn main() -> Result<()> {
 
             // Back buttons can trigger and cancel, but can't be recorded: the
             // virtual gamepad the game reads has no such buttons to replay.
-            let from_paddles = device_path.as_os_str() == DECK_PADDLES_PATH;
-            if state == State::Recording && !is_record_btn && !is_replay_btn && !is_picker_btn && !from_paddles && !is_system {
+            if state == State::Recording && from_gamepad && !is_record_btn && !is_replay_btn && !is_picker_btn && !from_paddles && !is_system {
                 if recorded_events.len() >= MAX_EVENTS {
                     state = State::Idle;
                     info!("Macro size limit reached. Stopped recording.");
@@ -1559,7 +1695,7 @@ fn main() -> Result<()> {
                 current_iteration += 1;
                 replay_index = 0;
                 replay_start_time = Instant::now();
-                info!("Looping macro (Iteration {})", current_iteration);
+                log::debug!("Looping macro (Iteration {})", current_iteration);
             } else {
                 is_replaying = false;
                 pending_recenter = true;
@@ -1607,6 +1743,11 @@ fn main() -> Result<()> {
                 loops = l;
                 cancel_on_input = c;
             }
+        }
+
+        if terminating && !pending_recenter {
+            info!("Daemon stopped cleanly");
+            return Ok(());
         }
 
         // Detect a stalled main loop (would delay injections and cancellation).
@@ -1879,5 +2020,36 @@ mod tests {
         assert_eq!(nav_changes(&report, &mut last), vec![(0x220, false), (0x130, true)]);
         report[8] = 0x20; // B
         assert_eq!(nav_changes(&report, &mut last), vec![(0x130, false), (0x131, true)]);
+    }
+
+    #[test]
+    fn echo_only_after_injection() {
+        let t = std::time::SystemTime::now();
+        assert!(is_echo(t + Duration::from_millis(1), t));
+        assert!(is_echo(t - Duration::from_millis(1), t), "within tolerance");
+        assert!(!is_echo(t - Duration::from_millis(30), t), "a press made before the injection is real");
+    }
+
+    #[test]
+    fn save_macro_is_atomic_and_readable() {
+        let dir = std::env::temp_dir().join("decky-macro-atomic-test");
+        let path = dir.join("macro_9.json");
+        let ev = vec![MacroEvent { delay_ms: 5, event_type: 1, code: 304, value: 1 }];
+        save_macro(&path, &ev);
+        assert_eq!(load_macro(&path), ev);
+        assert!(!dir.join("macro_9.json.tmp").exists(), "temp file renamed away");
+    }
+
+    #[test]
+    fn slot_settings_parse() {
+        let dir = std::env::temp_dir().join("decky-macro-slot-test");
+        let _ = fs::create_dir_all(&dir);
+        let f = dir.join("active_slot.json");
+        fs::write(&f, r#"{"macro_file":"/x/macro_2.json","loops":3,"cardinal_only":true}"#).unwrap();
+        let s = load_slot_settings(f.to_str().unwrap()).unwrap();
+        assert_eq!(s.macro_file, "/x/macro_2.json");
+        assert_eq!(s.loops, 3);
+        assert!(s.cancel_on_input && s.record_analog && s.cardinal_only);
+        assert!(load_slot_settings("").is_none());
     }
 }
