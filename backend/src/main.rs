@@ -190,6 +190,47 @@ struct Config {
     picker_trigger_mode: TriggerMode,
     #[serde(default = "default_press_count")]
     picker_press_count: u32,
+    // Per-trigger hold time / press window. Unset = the shared value above
+    // (hold_duration_ms / press_window_ms), so older config files keep working.
+    #[serde(default)]
+    record_hold_ms: Option<u64>,
+    #[serde(default)]
+    replay_hold_ms: Option<u64>,
+    #[serde(default)]
+    picker_hold_ms: Option<u64>,
+    #[serde(default)]
+    record_press_window_ms: Option<u64>,
+    #[serde(default)]
+    replay_press_window_ms: Option<u64>,
+    #[serde(default)]
+    picker_press_window_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Trigger {
+    Record,
+    Replay,
+    Picker,
+}
+
+impl Config {
+    fn hold(&self, t: Trigger) -> Duration {
+        let v = match t {
+            Trigger::Record => self.record_hold_ms,
+            Trigger::Replay => self.replay_hold_ms,
+            Trigger::Picker => self.picker_hold_ms,
+        };
+        Duration::from_millis(v.unwrap_or(self.hold_duration_ms))
+    }
+
+    fn press_window(&self, t: Trigger) -> Duration {
+        let v = match t {
+            Trigger::Record => self.record_press_window_ms,
+            Trigger::Replay => self.replay_press_window_ms,
+            Trigger::Picker => self.picker_press_window_ms,
+        };
+        Duration::from_millis(v.unwrap_or(self.press_window_ms))
+    }
 }
 
 fn default_press_count() -> u32 {
@@ -291,6 +332,12 @@ fn load_or_create_config(path: &str) -> Config {
         trigger_picker_code: 0,
         picker_trigger_mode: TriggerMode::Hold,
         picker_press_count: default_press_count(),
+        record_hold_ms: None,
+        replay_hold_ms: None,
+        picker_hold_ms: None,
+        record_press_window_ms: None,
+        replay_press_window_ms: None,
+        picker_press_window_ms: None,
     }
 }
 
@@ -810,13 +857,19 @@ fn main() -> Result<()> {
     info!("Loaded active slot: {:?}", active_macro_path);
     info!("Loops: {}, Cancel: {}, Record analog: {}, 4 directions: {}", loops, cancel_on_input, record_analog, cardinal_only);
     info!("Triggers: record={}, replay={}", key_label(config.trigger_record_code), key_label(config.trigger_replay_code));
-    info!("Trigger hold duration: {} ms", config.hold_duration_ms);
-    info!(
-        "Trigger modes: record={:?} (x{}), replay={:?} (x{}), press window {} ms",
-        config.record_trigger_mode, config.record_press_count,
-        config.replay_trigger_mode, config.replay_press_count,
-        config.press_window_ms
-    );
+    for (name, t, mode, count) in [
+        ("record", Trigger::Record, config.record_trigger_mode, config.record_press_count),
+        ("replay", Trigger::Replay, config.replay_trigger_mode, config.replay_press_count),
+        ("picker", Trigger::Picker, config.picker_trigger_mode, config.picker_press_count),
+    ] {
+        match mode {
+            TriggerMode::Hold => info!("Trigger {}: long press {} ms", name, config.hold(t).as_millis()),
+            TriggerMode::MultiPress => info!(
+                "Trigger {}: {} presses, max {} ms apart",
+                name, count, config.press_window(t).as_millis()
+            ),
+        }
+    }
 
     let (tx, rx) = mpsc::channel::<Msg>();
     let tx_discovery = tx.clone();
@@ -1173,7 +1226,7 @@ fn main() -> Result<()> {
                         picker_held_since = Some(now);
                         picker_triggered_this_press = false;
                         if config.picker_trigger_mode == TriggerMode::MultiPress
-                            && picker_presses.press(now, Duration::from_millis(config.press_window_ms), config.picker_press_count)
+                            && picker_presses.press(now, config.press_window(Trigger::Picker), config.picker_press_count)
                         {
                             picker_multi_fire = true;
                         }
@@ -1191,7 +1244,7 @@ fn main() -> Result<()> {
                         record_held_since = Some(now);
                         record_triggered_this_press = false;
                         if config.record_trigger_mode == TriggerMode::MultiPress
-                            && record_presses.press(now, Duration::from_millis(config.press_window_ms), config.record_press_count)
+                            && record_presses.press(now, config.press_window(Trigger::Record), config.record_press_count)
                         {
                             record_multi_fire = true;
                         }
@@ -1206,7 +1259,7 @@ fn main() -> Result<()> {
                         replay_held_since = Some(now);
                         replay_triggered_this_press = false;
                         if config.replay_trigger_mode == TriggerMode::MultiPress
-                            && replay_presses.press(now, Duration::from_millis(config.press_window_ms), config.replay_press_count)
+                            && replay_presses.press(now, config.press_window(Trigger::Replay), config.replay_press_count)
                         {
                             replay_multi_fire = true;
                         }
@@ -1275,7 +1328,7 @@ fn main() -> Result<()> {
             TriggerMode::Hold => {
                 let fire = record_held_since.map_or(false, |held| {
                     !record_triggered_this_press
-                        && held.elapsed() >= Duration::from_millis(config.hold_duration_ms)
+                        && held.elapsed() >= config.hold(Trigger::Record)
                         && replay_held_since.is_none()
                 });
                 if fire {
@@ -1301,7 +1354,7 @@ fn main() -> Result<()> {
                 if record_analog {
                     recorded_events.extend(analog_recorder.start(&axis_state));
                 }
-                info!("Started recording to {:?} (hold {}ms)", active_macro_path, config.hold_duration_ms);
+                info!("Started recording to {:?}", active_macro_path);
             } else {
                 state = State::Idle;
                 let has_input = !recorded_events.is_empty();
@@ -1325,7 +1378,7 @@ fn main() -> Result<()> {
             TriggerMode::Hold => {
                 let fire = replay_held_since.map_or(false, |held| {
                     !replay_triggered_this_press
-                        && held.elapsed() >= Duration::from_millis(config.hold_duration_ms)
+                        && held.elapsed() >= config.hold(Trigger::Replay)
                         && record_held_since.is_none()
                 });
                 if fire {
@@ -1339,7 +1392,7 @@ fn main() -> Result<()> {
             TriggerMode::MultiPress => std::mem::take(&mut picker_multi_fire),
             TriggerMode::Hold => {
                 let fire = picker_held_since.map_or(false, |held| {
-                    !picker_triggered_this_press && held.elapsed() >= Duration::from_millis(config.hold_duration_ms)
+                    !picker_triggered_this_press && held.elapsed() >= config.hold(Trigger::Picker)
                 });
                 if fire {
                     picker_triggered_this_press = true;
@@ -1406,7 +1459,7 @@ fn main() -> Result<()> {
                     axis_overrides = 0;
                     injected_count = 0;
                     playback_started = Instant::now();
-                    info!("Started playback from {:?} (hold {}ms)", active_macro_path, config.hold_duration_ms);
+                    info!("Started playback from {:?}", active_macro_path);
                 }
             }
         }
@@ -1718,5 +1771,17 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Farm");
         assert!(load_picker_items("/nonexistent").is_empty());
+    }
+
+    #[test]
+    fn per_trigger_timings_fall_back_to_shared_values() {
+        let c: Config = serde_json::from_str(
+            r#"{"trigger_record_code":317,"trigger_replay_code":318,"hold_duration_ms":700,"press_window_ms":300,
+                "replay_hold_ms":0,"picker_press_window_ms":900}"#,
+        ).unwrap();
+        assert_eq!(c.hold(Trigger::Record), Duration::from_millis(700));
+        assert_eq!(c.hold(Trigger::Replay), Duration::from_millis(0));
+        assert_eq!(c.press_window(Trigger::Replay), Duration::from_millis(300));
+        assert_eq!(c.press_window(Trigger::Picker), Duration::from_millis(900));
     }
 }

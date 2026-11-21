@@ -211,7 +211,7 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
 const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
   const [recordCode, setRecordCode] = useState(initialConfig?.trigger_record_code ?? 317);
   const [replayCode, setReplayCode] = useState(initialConfig?.trigger_replay_code ?? 318);
-  const [holdMs, setHoldMs] = useState(initialConfig?.hold_duration_ms ?? 500);
+  const holdMs = initialConfig?.hold_duration_ms ?? 500;
   const [recordLabel, setRecordLabel] = useState<string | undefined>(initialConfig?.trigger_record_label);
   const [replayLabel, setReplayLabel] = useState<string | undefined>(initialConfig?.trigger_replay_label);
   const [detecting, setDetecting] = useState<string>("");
@@ -219,11 +219,20 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
   const [replayMode, setReplayMode] = useState<string>(initialConfig?.replay_trigger_mode ?? "hold");
   const [recordCount, setRecordCount] = useState<number>(initialConfig?.record_press_count ?? 3);
   const [replayCount, setReplayCount] = useState<number>(initialConfig?.replay_press_count ?? 3);
-  const [pressWindowMs, setPressWindowMs] = useState<number>(initialConfig?.press_window_ms ?? 400);
+  const pressWindowMs = initialConfig?.press_window_ms ?? 400;
   const [pickerCode, setPickerCode] = useState<number>(initialConfig?.trigger_picker_code ?? 0);
   const [pickerLabel, setPickerLabel] = useState<string | undefined>(initialConfig?.trigger_picker_label);
   const [pickerMode, setPickerMode] = useState<string>(initialConfig?.picker_trigger_mode ?? "hold");
   const [pickerCount, setPickerCount] = useState<number>(initialConfig?.picker_press_count ?? 3);
+  // Per-trigger timings; the old shared values are the starting point.
+  const sharedHold = initialConfig?.hold_duration_ms ?? 500;
+  const sharedWindow = initialConfig?.press_window_ms ?? 400;
+  const [recordHold, setRecordHold] = useState<number>(initialConfig?.record_hold_ms ?? sharedHold);
+  const [replayHold, setReplayHold] = useState<number>(initialConfig?.replay_hold_ms ?? sharedHold);
+  const [pickerHold, setPickerHold] = useState<number>(initialConfig?.picker_hold_ms ?? sharedHold);
+  const [recordWindow, setRecordWindow] = useState<number>(initialConfig?.record_press_window_ms ?? sharedWindow);
+  const [replayWindow, setReplayWindow] = useState<number>(initialConfig?.replay_press_window_ms ?? sharedWindow);
+  const [pickerWindow, setPickerWindow] = useState<number>(initialConfig?.picker_press_window_ms ?? sharedWindow);
 
   const modeOptions = [
     { data: "hold", label: "Long press" },
@@ -233,19 +242,47 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
     mode: string,
     setMode: (m: string) => void,
     count: number,
-    setCount: (n: number) => void
+    setCount: (n: number) => void,
+    holdMs: number,
+    setHoldMs: (n: number) => void,
+    windowMs: number,
+    setWindowMs: (n: number) => void
   ) => (
     <>
       <Dropdown rgOptions={modeOptions} selectedOption={mode} onChange={(opt: any) => setMode(opt.data)} />
-      {mode === "multi_press" && (
+      {mode === "multi_press" ? (
+        <>
+          <SliderField
+            label="Presses in a row"
+            value={count}
+            min={2}
+            max={10}
+            step={1}
+            showValue={true}
+            onChange={(v: number) => setCount(Math.round(v))}
+          />
+          <SliderField
+            label="Max time between presses"
+            value={windowMs / 1000}
+            min={0.2}
+            max={1}
+            step={0.05}
+            showValue={true}
+            valueSuffix="s"
+            onChange={(v: number) => setWindowMs(Math.round(v * 1000))}
+          />
+        </>
+      ) : (
         <SliderField
-          label="Presses in a row"
-          value={count}
-          min={2}
-          max={10}
-          step={1}
+          label="Hold time"
+          description="0 = trigger on press"
+          value={holdMs / 1000}
+          min={0}
+          max={2}
+          step={0.1}
           showValue={true}
-          onChange={(v: number) => setCount(Math.round(v))}
+          valueSuffix="s"
+          onChange={(v: number) => setHoldMs(Math.round(v * 1000))}
         />
       )}
     </>
@@ -285,6 +322,12 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
           trigger_picker_label: pickerLabel,
           picker_trigger_mode: pickerMode,
           picker_press_count: pickerCount,
+          record_hold_ms: recordHold,
+          replay_hold_ms: replayHold,
+          picker_hold_ms: pickerHold,
+          record_press_window_ms: recordWindow,
+          replay_press_window_ms: replayWindow,
+          picker_press_window_ms: pickerWindow,
         });
         closeModal();
       }}
@@ -305,7 +348,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
         <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("record")}>
           {detecting === "record" ? "Press the button now (10 s)..." : "Detect record button"}
         </ButtonItem>
-        {triggerMode(recordMode, setRecordMode, recordCount, setRecordCount)}
+        {triggerMode(recordMode, setRecordMode, recordCount, setRecordCount, recordHold, setRecordHold, recordWindow, setRecordWindow)}
 
         <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Replay Trigger:</b></div>
         <Dropdown
@@ -316,7 +359,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
         <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("replay")}>
           {detecting === "replay" ? "Press the button now (10 s)..." : "Detect replay button"}
         </ButtonItem>
-        {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount)}
+        {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount, replayHold, setReplayHold, replayWindow, setReplayWindow)}
 
         <div style={{ marginTop: "12px", marginBottom: "5px" }}><b>Macro Picker Trigger:</b></div>
         <div style={{ fontSize: "11px", color: "#bbb", marginBottom: "5px" }}>
@@ -332,38 +375,10 @@ const SettingsModal = ({ initialConfig, onSave, closeModal }: any) => {
             <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("picker")}>
               {detecting === "picker" ? "Press the button now (10 s)..." : "Detect picker button"}
             </ButtonItem>
-            {triggerMode(pickerMode, setPickerMode, pickerCount, setPickerCount)}
+            {triggerMode(pickerMode, setPickerMode, pickerCount, setPickerCount, pickerHold, setPickerHold, pickerWindow, setPickerWindow)}
           </>
         )}
 
-        <div style={{ marginTop: "12px" }}>
-          {(recordMode === "multi_press" || replayMode === "multi_press" || (pickerCode !== 0 && pickerMode === "multi_press")) && (
-            <SliderField
-              label="Max time between presses"
-              description="Presses further apart than this start a new series"
-              value={pressWindowMs / 1000}
-              min={0.2}
-              max={1}
-              step={0.05}
-              showValue={true}
-              valueSuffix="s"
-              onChange={(v: number) => setPressWindowMs(Math.round(v * 1000))}
-            />
-          )}
-          {(recordMode === "hold" || replayMode === "hold" || (pickerCode !== 0 && pickerMode === "hold")) && (
-          <SliderField
-            label="Trigger hold time"
-            description="How long to hold Record/Replay before it activates (0 = trigger on press)"
-            value={holdMs / 1000}
-            min={0}
-            max={2}
-            step={0.1}
-            showValue={true}
-            valueSuffix="s"
-            onChange={(v: number) => setHoldMs(Math.round(v * 1000))}
-          />
-          )}
-        </div>
       </div>
     </ConfirmModal>
   );
