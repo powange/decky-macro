@@ -6,9 +6,10 @@ import threading
 import asyncio
 import traceback
 import pwd
-import shutil
 import time
 import signal
+import select
+import socket
 from collections import deque
 import decky_plugin
 
@@ -39,9 +40,134 @@ def _read_macro(path):
                 pass
     return events
 
-# Environment variables set by Decky's bundled (PyInstaller) python that would
-# break the system python3 used for the picker overlay.
-_STRIP_ENV = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")
+# ---- Decky Overlay ----------------------------------------------------------
+# gamescope shows a single external overlay window, so the macro picker is drawn
+# by the Decky Overlay plugin (powange/decky-overlay), shared with Decky Timer
+# and others. Protocol: JSON lines on a Unix socket; our blocks disappear when
+# the connection closes.
+OVERLAY_SOCKET = "/tmp/decky-overlay/overlay.sock"
+OVERLAY_PLUGIN_NAME = "Decky Overlay"
+OVERLAY_RETRY = 2.0          # seconds between connection attempts
+MENU_TEXT = {
+    "en": ("Choose a macro", "D-pad / stick: choose · A: play · B: close"),
+    "fr": ("Choisir une macro", "Croix / stick : choisir · A : lancer · B : fermer"),
+}
+
+
+class OverlayClient:
+    """Blocking client for Decky Overlay, used from the daemon log thread."""
+
+    def __init__(self, on_error=None):
+        self.sock = None
+        self.lock = threading.Lock()
+        self.last_attempt = 0.0
+        self.error = ""
+        self.features = []
+        self.on_error = on_error
+
+    @property
+    def connected(self):
+        return self.sock is not None
+
+    def _connect(self, force=False):
+        """Connects if needed (lock held). Returns True when connected."""
+        if self.sock is not None:
+            return True
+        if not force and time.time() - self.last_attempt < OVERLAY_RETRY:
+            return False
+        self.last_attempt = time.time()
+        if not os.path.exists(OVERLAY_SOCKET):
+            return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(2)
+            sock.connect(OVERLAY_SOCKET)
+            sock.settimeout(None)
+            self.sock = sock
+            self._write({"op": "hello", "client": "decky-macro", "name": "Decky Macro", "protocol": 1})
+        except OSError as e:
+            self.sock = None
+            sock.close()
+            self.error = f"Decky Overlay: {e}"
+            return False
+        self.error = ""
+        threading.Thread(target=self._read, args=(sock,), daemon=True).start()
+        return True
+
+    def _write(self, msg):
+        # Never block the log thread for long on a stuck server.
+        _, writable, _ = select.select([], [self.sock], [], 0.5)
+        if not writable:
+            raise OSError("Decky Overlay not responding")
+        self.sock.sendall((json.dumps(msg) + "\n").encode())
+
+    def _read(self, sock):
+        try:
+            for line in sock.makefile("rb"):
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("op") == "welcome":
+                    self.features = list(msg.get("features") or [])
+                elif msg.get("op") == "error":
+                    self.error = f"Decky Overlay: {msg.get('error')}"
+                    decky_plugin.logger.warning(self.error)
+                    if self.on_error:
+                        self.on_error(str(msg.get("error") or ""))
+        except (OSError, ValueError):
+            pass
+        with self.lock:
+            if self.sock is sock:
+                self._drop()
+
+    def _drop(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def ensure(self):
+        with self.lock:
+            return self._connect()
+
+    def send(self, msg, force=False):
+        """Sends one message, connecting first if needed. False if not sent."""
+        with self.lock:
+            if not self._connect(force):
+                return False
+            try:
+                self._write(msg)
+                return True
+            except OSError as e:
+                self.error = f"Decky Overlay: {e}"
+                self._drop()
+                return False
+
+    def close(self):
+        with self.lock:
+            self._drop()
+
+
+def _overlay_installed():
+    """True if a plugin named "Decky Overlay" is in Decky's plugins folder."""
+    home = getattr(decky_plugin, "DECKY_HOME", "") or "/home/deck/homebrew"
+    plugins = os.path.join(home, "plugins")
+    try:
+        names = os.listdir(plugins)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(plugins, name, "plugin.json")) as f:
+                if json.load(f).get("name") == OVERLAY_PLUGIN_NAME:
+                    return True
+        except (OSError, ValueError, AttributeError):
+            continue
+    return False
+
 
 # Default global config. `hold_duration_ms` is how long the record/replay
 # trigger buttons must be held before activating (0 = trigger on press).
@@ -74,7 +200,7 @@ class Plugin:
     stats_version = 0          # bumped when a macro file changes
     detect_event = threading.Event()
     detect_result = None
-    overlay_display = ":0"     # X display of gamescope's Xwayland
+    ui_lang = "en"             # menu language, sent by the frontend
 
     def __init__(self):
         self.config_dir = decky_plugin.DECKY_PLUGIN_SETTINGS_DIR
@@ -82,6 +208,9 @@ class Plugin:
         self.data_path = os.path.join(self.config_dir, "data.json")
         self.bin_path = os.path.join(decky_plugin.DECKY_PLUGIN_DIR, "bin", "decky-macro-daemon")
         self.notifications = []
+        self.overlay = OverlayClient(on_error=self._overlay_error)
+        self.menu_open = False
+        self.menu_warned = False
 
         if not os.path.exists(self.config_dir):
             os.makedirs(self.config_dir)
@@ -212,10 +341,10 @@ class Plugin:
                             return
                         # Picker menu messages go to the overlay, not the log.
                         if line_str.startswith("PICKER_SHOW "):
-                            self._overlay_send({"menu": json.loads(line_str[len("PICKER_SHOW "):])})
+                            self._show_menu(json.loads(line_str[len("PICKER_SHOW "):]))
                             return
                         if line_str == "PICKER_HIDE":
-                            self._overlay_send({"menu": None})
+                            self._hide_menu()
                             return
                         decky_plugin.logger.info(f"[Rust] {line_str}")
 
@@ -286,95 +415,54 @@ class Plugin:
         return path
 
     def _ensure_overlay(self):
-        """Starts the overlay process ahead of time when a picker trigger is
-        set, so the menu shows without Python's start-up delay."""
+        """Connects to Decky Overlay ahead of time when a picker trigger is set,
+        so the first menu shows at once."""
         try:
             with open(self.config_path, "r") as f:
                 wanted = bool(json.load(f).get("trigger_picker_code"))
         except Exception:
             wanted = False
-        proc = getattr(self, "overlay", None)
-        running = proc is not None and proc.poll() is None
-        if wanted and not running and Plugin.process is not None and Plugin.process.poll() is None:
-            self._start_overlay()
-        elif not wanted and running:
-            self._stop_overlay()
+        if wanted and Plugin.process is not None and Plugin.process.poll() is None:
+            self.overlay.ensure()
 
-    def _start_overlay(self):
-        """Starts the in-game picker overlay process.
+    def _show_menu(self, menu):
+        """Draws the picker through Decky Overlay (input stays with the daemon)."""
+        title, hint = MENU_TEXT.get(Plugin.ui_lang, MENU_TEXT["en"])
+        items = [str(i) for i in menu.get("items", [])] or ["-"]
+        sent = self.overlay.send({"op": "menu", "id": "picker", "title": title, "hint": hint,
+                                  "items": items, "selected": int(menu.get("selected", 0))},
+                                 force=not self.menu_open)
+        self.menu_open = True
+        if not sent and not self.menu_warned:
+            self.menu_warned = True
+            if _overlay_installed():
+                self._notify("Macro picker: Decky Overlay is not running", error=True)
+            else:
+                self._notify("Macro picker needs the Decky Overlay plugin", error=True)
 
-        gamescope composites a single GAMESCOPE_EXTERNAL_OVERLAY window at a
-        time, so the process only creates its window while the picker menu is
-        shown; otherwise it would hide other plugins' overlays (Decky Timer)."""
-        self._stop_overlay()
-        python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else shutil.which("python3")
-        script = os.path.join(decky_plugin.DECKY_PLUGIN_DIR, "overlay", "picker.py")
-        if not python or not os.path.exists(script):
-            decky_plugin.logger.error("Picker overlay: python3 or overlay script not found")
-            return
-        env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
-        env["DISPLAY"] = Plugin.overlay_display
-        user_kwargs = {}
-        if os.geteuid() == 0:
-            # The overlay runs as the desktop user, who owns the gamescope X session.
-            try:
-                pw = pwd.getpwnam(getattr(decky_plugin, "DECKY_USER", "deck"))
-                env.update({"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
-                            "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}"})
-                user_kwargs = {"user": pw.pw_uid, "group": pw.pw_gid}
-            except Exception as e:
-                decky_plugin.logger.warning(f"Picker overlay: cannot drop privileges: {e}")
-        log_path = os.path.join(decky_plugin.DECKY_PLUGIN_LOG_DIR, "picker-overlay.log")
-        try:
-            log = open(log_path, "a")
-            log.write(f"--- start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            log.flush()
-            self.overlay = subprocess.Popen(
-                [python, "-u", script], stdin=subprocess.PIPE, stdout=log, stderr=log,
-                env=env, cwd=os.path.dirname(script), **user_kwargs,
-            )
-            log.close()
-            decky_plugin.logger.info("Picker overlay started")
-        except Exception as e:
-            self.overlay = None
-            decky_plugin.logger.error(f"Picker overlay: start failed: {e}")
+    def _hide_menu(self):
+        self.menu_open = False
+        self.menu_warned = False
+        self.overlay.send({"op": "clear", "id": "picker"})
 
-    def _overlay_send(self, message):
-        proc = getattr(self, "overlay", None)
-        if message.get("menu") is None:
-            # Menu closed: the overlay destroys its window and stays ready.
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.stdin.write(b'{"menu": null}\n')
-                    proc.stdin.flush()
-                except Exception:
-                    pass
-            decky_plugin.logger.info("Picker overlay closed")
-            return
-        if proc is None or proc.poll() is not None:
-            self._start_overlay()
-            proc = getattr(self, "overlay", None)
-        if proc is None or proc.poll() is not None:
-            self._notify("Macro picker overlay could not start (see picker-overlay.log)", error=True)
-            return
-        try:
-            proc.stdin.write((json.dumps(message) + "\n").encode())
-            proc.stdin.flush()
-        except Exception as e:
-            decky_plugin.logger.error(f"Picker overlay: write failed: {e}")
+    def _overlay_error(self, error):
+        if "unknown op" in error and not self.menu_warned:
+            self.menu_warned = True
+            self._notify("Macro picker: update Decky Overlay", error=True)
 
-    def _stop_overlay(self):
-        proc = getattr(self, "overlay", None)
-        self.overlay = None
-        if proc is not None:
-            try:
-                proc.stdin.close()
-                proc.wait(timeout=2)
-            except Exception:
-                proc.kill()
+    def _overlay_status(self):
+        if self.overlay.connected:
+            if self.overlay.features and "menu" not in self.overlay.features:
+                return "outdated"
+            return "connected"
+        if not hasattr(self, "_overlay_checked") or time.time() - self._overlay_checked > 10:
+            self._overlay_is_installed = _overlay_installed()
+            self._overlay_checked = time.time()
+        return "not_running" if self._overlay_is_installed else "not_installed"
 
     def stop_daemon(self):
-        self._stop_overlay()
+        self.menu_open = False
+        self.overlay.close()
         if Plugin.process:
             decky_plugin.logger.info("Stopping decky-macro-daemon daemon...")
             # SIGTERM: the daemon releases held inputs and saves a recording
@@ -474,7 +562,21 @@ class Plugin:
         running = self.get_daemon_state_sync()
         with Plugin.lock:
             state = dict(Plugin.daemon_state) if running else {}
-        return {"running": running, "state": state, "stats_version": Plugin.stats_version}
+        return {"running": running, "state": state, "stats_version": Plugin.stats_version,
+                "overlay": self._overlay_status()}
+
+    async def set_ui_language(self, lang: str) -> bool:
+        """Language of the in-game picker (the frontend resolves "auto")."""
+        Plugin.ui_lang = "fr" if lang == "fr" else "en"
+        return True
+
+    async def recheck_overlay(self) -> str:
+        """After installing Decky Overlay: connect now instead of waiting."""
+        self._overlay_checked = 0.0
+        if Plugin.process is not None and Plugin.process.poll() is None:
+            with self.overlay.lock:
+                self.overlay._connect(force=True)
+        return self._overlay_status()
 
     # --- A6: a slot per game -------------------------------------------------
 

@@ -21,7 +21,7 @@ import {
 
 import { useState, useEffect, useMemo } from "react";
 import { FaGamepad } from "react-icons/fa";
-import { t, tToast, setLanguage, formatDuration } from "./i18n";
+import { t, tToast, setLanguage as setUiLanguage, getLanguage, formatDuration } from "./i18n";
 
 const getGlobalConfig = callable<[], any>("get_config");
 const saveGlobalConfig = callable<[config: any], boolean>("save_config");
@@ -35,14 +35,80 @@ const getSlotStats = callable<[], Record<string, { events: number; duration_ms: 
 const getMacroPreview = callable<[slotId: string], { count: number; duration_ms: number; rows: { i: number; t: number; input: string; action: string }[] }>("get_macro_preview");
 const getDiagnostics = callable<[], { running: boolean; version: string; triggers: Record<string, any>; lines: string[] }>("get_diagnostics");
 const getNotifications = callable<[], { message: string; error?: boolean }[]>("get_notifications");
-type DaemonStatus = { running: boolean; state: any; stats_version: number };
+type OverlayStatus = "connected" | "not_running" | "not_installed" | "outdated";
+type DaemonStatus = { running: boolean; state: any; stats_version: number; overlay?: OverlayStatus };
 const getStatus = callable<[], DaemonStatus>("get_status");
+const setBackendLanguage = callable<[lang: string], boolean>("set_ui_language");
+const recheckOverlay = callable<[], OverlayStatus>("recheck_overlay");
 const setRunningGame = callable<[appId: string, name: string], string>("set_running_game");
 const exportMacro = callable<[slotId: string], { path?: string; error?: string }>("export_macro");
 const listExports = callable<[], string[]>("list_exports");
 const importMacro = callable<[filename: string, slotId: string], { events?: number; error?: string }>("import_macro");
 const deleteMacroEvent = callable<[slotId: string, index: number], { removed?: number; error?: string }>("delete_macro_event");
 const trimMacroStart = callable<[slotId: string], { trimmed_ms?: number; error?: string }>("trim_macro_start");
+
+/** Sets the UI language and tells the backend (the in-game picker uses it). */
+const setLanguage = (setting?: string) => {
+  setUiLanguage(setting);
+  setBackendLanguage(getLanguage()).catch(() => {});
+};
+
+// The picker is drawn by the Decky Overlay plugin (powange/decky-overlay):
+// gamescope shows one external overlay at a time, so plugins share it.
+const OVERLAY_REPO = "powange/decky-overlay";
+const OVERLAY_ASSET = "decky-overlay.zip";
+const OVERLAY_PLUGIN_NAME = "Decky Overlay"; // "name" in its plugin.json
+const OVERLAY_URL = `https://github.com/${OVERLAY_REPO}/releases/latest/download/${OVERLAY_ASSET}`;
+const INSTALL_TYPE_INSTALL = 0; // Decky's PluginInstallType.INSTALL
+
+/** Opens Decky's install (or update) dialog for Decky Overlay. Returns an error or "". */
+async function installDeckyOverlay(update: boolean): Promise<string> {
+  const backend = (window as any).DeckyBackend;
+  if (typeof backend?.call !== "function") return t("noInstallApi", { url: OVERLAY_URL });
+  try {
+    let version = "latest";
+    try {
+      const res = await fetchNoCors(`https://api.github.com/repos/${OVERLAY_REPO}/releases/latest`, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (res.ok) version = String((await res.json()).tag_name ?? "latest").replace(/^v/, "");
+    } catch {
+      // keep "latest": the URL always points to the newest release
+    }
+    await backend.call("utilities/install_plugin", OVERLAY_URL, OVERLAY_PLUGIN_NAME, version, "",
+      update ? INSTALL_TYPE_UPDATE : INSTALL_TYPE_INSTALL);
+    return "";
+  } catch (e: any) {
+    return t("overlayInstallFailed", { e: e?.message ?? String(e), url: OVERLAY_URL });
+  }
+}
+
+function OverlayNotice({ status }: { status?: OverlayStatus }) {
+  const [message, setMessage] = useState("");
+  if (status !== "not_installed" && status !== "outdated") return null;
+  const update = status === "outdated";
+  return (
+    <>
+      <PanelSectionRow>
+        <div style={{ ...small, color: "#ffcc00" }}>
+          {update ? t("overlayOutdated") : t("overlayMissing")}
+          {message && <div style={{ color: "#ff8080", wordBreak: "break-all" }}>{message}</div>}
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          onClick={async () => {
+            setMessage(await installDeckyOverlay(update));
+            recheckOverlay().catch(() => {});
+          }}
+        >
+          {update ? t("overlayUpdate") : t("overlayInstall")}
+        </ButtonItem>
+      </PanelSectionRow>
+    </>
+  );
+}
 
 /** The game in the foreground, if any (A6). */
 const runningGame = (): { id: string; name: string } | null => {
@@ -81,6 +147,9 @@ const withCustom = (code: number, label?: string) => {
     : [...opts, { data: code, label: t("detected", { label: label || `key ${code}` }) }];
 };
 
+// Decky's PluginInstallType.UPDATE
+const INSTALL_TYPE_UPDATE = 2;
+
 // Releases of this fork are published by .github/workflows/release.yml.
 const UPDATE_REPO = "powange/decky-macro";
 const UPDATE_ASSET = "decky-macro.zip";
@@ -98,8 +167,6 @@ const compareVersions = (a: string, b: string) => {
 };
 // Must match "name" in plugin.json so Decky replaces the installed plugin.
 const PLUGIN_NAME = "Decky Macro";
-// Decky's PluginInstallType.UPDATE
-const INSTALL_TYPE_UPDATE = 2;
 
 const small = { fontSize: "11px", color: "#bbb", lineHeight: "1.3" } as const;
 
@@ -863,6 +930,7 @@ function Content() {
             )}
           </div>
         </PanelSectionRow>
+        {!!globalConfig?.trigger_picker_code && <OverlayNotice status={status?.overlay} />}
       </PanelSection>
 
       <PanelSection>
