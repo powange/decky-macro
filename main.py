@@ -68,6 +68,13 @@ class Plugin:
     # Last daemon log lines, for the Diagnostic view.
     log_lines = deque(maxlen=200)
     process = None
+    # Shared between the daemon log thread and the frontend calls.
+    lock = threading.Lock()
+    daemon_state = {}          # last STATE line of the daemon
+    stats_version = 0          # bumped when a macro file changes
+    detect_event = threading.Event()
+    detect_result = None
+    overlay_display = ":0"     # X display of gamescope's Xwayland
 
     def __init__(self):
         self.config_dir = decky_plugin.DECKY_PLUGIN_SETTINGS_DIR
@@ -116,6 +123,10 @@ class Plugin:
                 "record_analog": bool(sc.get("record_analog", True)),
                 "cardinal_only": bool(sc.get("cardinal_only", False)),
                 "speed": float(sc.get("speed", 1.0)),
+                "record_append": bool(sc.get("record_append", False)),
+                "loop_pause_ms": int(sc.get("loop_pause_ms", 0)),
+                "max_minutes": int(sc.get("max_minutes", 0)),
+                "jitter_ms": int(sc.get("jitter_ms", 0)),
             }, f)
         os.replace(tmp, path)
         return path
@@ -182,13 +193,23 @@ class Plugin:
                                 pass
 
             def notify(message, error=False):
-                self.notifications.append({"message": message, "error": error})
+                self._notify(message, error)
 
             def handle_line(line):
                         line_str = line.decode('utf-8', errors='replace').strip()
                         if not line_str.startswith("PICKER_"):
                             Plugin.log_lines.append(line_str)
 
+                        # Status for the panel (F10/F11), not logged.
+                        if line_str.startswith("STATE "):
+                            with Plugin.lock:
+                                Plugin.daemon_state = json.loads(line_str[len("STATE "):])
+                            return
+                        # Trigger detection while the daemon runs (F12).
+                        if line_str.startswith("DETECTED ") or line_str == "DETECT_TIMEOUT":
+                            Plugin.detect_result = line_str
+                            Plugin.detect_event.set()
+                            return
                         # Picker menu messages go to the overlay, not the log.
                         if line_str.startswith("PICKER_SHOW "):
                             self._overlay_send({"menu": json.loads(line_str[len("PICKER_SHOW "):])})
@@ -201,6 +222,7 @@ class Plugin:
                         if "Started recording to" in line_str:
                             notify("Recording Started")
                         elif "Stopped recording. Saved" in line_str:
+                            Plugin.stats_version += 1
                             notify("Recording Saved")
                         elif "Recording stopped with no inputs" in line_str:
                             notify("No inputs recorded - nothing saved", error=True)
@@ -228,6 +250,8 @@ class Plugin:
                             notify("No recorded macro to choose from", error=True)
                         elif "Picker: cannot open gamepad" in line_str:
                             notify("Macro picker: cannot read the gamepad", error=True)
+                        elif "Playback stopped:" in line_str and "limit reached" in line_str:
+                            notify("Playback stopped: time limit reached")
                         
             threading.Thread(target=log_output, args=(Plugin.process.stdout,), daemon=True).start()
             self._ensure_overlay()
@@ -253,6 +277,9 @@ class Plugin:
                 "loops": int(sc.get("loops", 0)),
                 "cancel_on_input": bool(sc.get("cancel_on_input", True)),
                 "speed": float(sc.get("speed", 1.0)),
+                "loop_pause_ms": int(sc.get("loop_pause_ms", 0)),
+                "max_minutes": int(sc.get("max_minutes", 0)),
+                "jitter_ms": int(sc.get("jitter_ms", 0)),
             })
         with open(path, "w") as f:
             json.dump(items, f)
@@ -286,7 +313,7 @@ class Plugin:
             decky_plugin.logger.error("Picker overlay: python3 or overlay script not found")
             return
         env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
-        env["DISPLAY"] = os.environ.get("DECKY_MACRO_TEST_DISPLAY", ":0")
+        env["DISPLAY"] = Plugin.overlay_display
         user_kwargs = {}
         if os.geteuid() == 0:
             # The overlay runs as the desktop user, who owns the gamescope X session.
@@ -328,7 +355,7 @@ class Plugin:
             self._start_overlay()
             proc = getattr(self, "overlay", None)
         if proc is None or proc.poll() is not None:
-            self.notifications.append({"message": "Macro picker overlay could not start (see picker-overlay.log)", "error": True})
+            self._notify("Macro picker overlay could not start (see picker-overlay.log)", error=True)
             return
         try:
             proc.stdin.write((json.dumps(message) + "\n").encode())
@@ -367,23 +394,30 @@ class Plugin:
         them to a keyboard key (the Deck does not expose them otherwise)."""
         if which not in ("record", "replay", "picker"):
             return {"error": "invalid trigger"}
-        if await self.get_daemon_state():
-            return {"error": "Stop the daemon first"}
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                self.bin_path, "--detect-button", "10000",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-        except Exception as e:
-            decky_plugin.logger.error(f"Button detection failed: {e}\n{traceback.format_exc()}")
-            return {"error": str(e)}
-
-        line = out.decode("utf-8", errors="replace").strip().splitlines()[-1:] or [""]
+        if self.get_daemon_state_sync():
+            # The running daemon sees every device: ask it (SIGUSR1) and wait for
+            # its DETECTED / DETECT_TIMEOUT line, read by the log thread.
+            Plugin.detect_event.clear()
+            Plugin.detect_result = None
+            Plugin.process.send_signal(signal.SIGUSR1)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, Plugin.detect_event.wait, 12)
+            line = [Plugin.detect_result or ""]
+        else:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    self.bin_path, "--detect-button", "10000",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            except Exception as e:
+                decky_plugin.logger.error(f"Button detection failed: {e}\n{traceback.format_exc()}")
+                return {"error": str(e)}
+            line = out.decode("utf-8", errors="replace").strip().splitlines()[-1:] or [""]
         parts = line[0].split(" ", 3)
         if len(parts) < 3 or parts[0] != "DETECTED":
-            self.notifications.append({"message": "No button press detected", "error": True})
+            self._notify("No button press detected", error=True)
             return {"error": "timeout"}
 
         code, label = int(parts[1]), parts[2]
@@ -393,7 +427,7 @@ class Plugin:
         config[f"trigger_{which}_label"] = label
         await self.save_config(config)
         decky_plugin.logger.info(f"Detected {which} trigger: {label} ({code}) from {device}")
-        self.notifications.append({"message": f"{which.capitalize()} trigger set to {label}"})
+        self._notify(f"{which.capitalize()} trigger set to {label}")
         return {"code": code, "label": label, "device": device}
 
     # ------------------------------------------------------------------ #
@@ -412,7 +446,7 @@ class Plugin:
         """A readable timeline of a slot's macro (first 300 events)."""
         events = _read_macro(os.path.join(self.config_dir, f"macro_{slot_id}.json"))
         rows = []
-        for delay, etype, code, value in events[:300]:
+        for idx, (delay, etype, code, value) in enumerate(events[:300]):
             if etype == 1:
                 name = KEY_NAMES.get(code, f"key {code}")
                 what = "press" if value == 1 else "release" if value == 0 else f"repeat"
@@ -428,8 +462,142 @@ class Plugin:
                     what = f"{round(value * 100 / 32767)}%" if value else "center"
             else:
                 continue
-            rows.append({"t": delay, "input": name, "action": what})
+            rows.append({"i": idx, "t": delay, "input": name, "action": what})
         return {"count": len(events), "duration_ms": events[-1][0] if events else 0, "rows": rows}
+
+    def get_daemon_state_sync(self) -> bool:
+        return Plugin.process is not None and Plugin.process.poll() is None
+
+    async def get_status(self) -> dict:
+        """Daemon state (F10/F11) and a counter that changes when a macro file
+        changes, so the panel only re-reads the slot stats when needed (P8)."""
+        running = self.get_daemon_state_sync()
+        with Plugin.lock:
+            state = dict(Plugin.daemon_state) if running else {}
+        return {"running": running, "state": state, "stats_version": Plugin.stats_version}
+
+    # --- A6: a slot per game -------------------------------------------------
+
+    async def set_running_game(self, app_id: str, name: str = "") -> str:
+        """Called by the panel when the running game changes: selects the slot
+        associated with that game, if any. Returns the selected slot id or ""."""
+        if not app_id:
+            return ""
+        data = self._get_data()
+        for sid, sc in data.get("slots", {}).items():
+            if str(sc.get("game_id", "")) == str(app_id):
+                if str(data.get("active_slot")) != str(sid):
+                    data["active_slot"] = sid
+                    await self.save_slots_data(data)
+                    self._notify(f"Slot selected for {name or app_id}: {sc.get('name', sid)}")
+                return str(sid)
+        return ""
+
+    # --- A7: export / import ---------------------------------------------------
+
+    def _exports_dir(self) -> str:
+        home = getattr(decky_plugin, "DECKY_USER_HOME", None)
+        if not home:
+            try:
+                home = pwd.getpwnam(getattr(decky_plugin, "DECKY_USER", "deck")).pw_dir
+            except Exception:
+                home = os.path.expanduser("~")
+        path = os.path.join(home, "decky-macro-exports")
+        os.makedirs(path, exist_ok=True)
+        self._give_to_user(path)
+        return path
+
+    def _give_to_user(self, path):
+        """Files written by the root backend in the user's home belong to the user."""
+        try:
+            pw = pwd.getpwnam(getattr(decky_plugin, "DECKY_USER", "deck"))
+            if os.geteuid() == 0:
+                os.chown(path, pw.pw_uid, pw.pw_gid)
+        except Exception:
+            pass
+
+    async def export_macro(self, slot_id: str) -> dict:
+        data = self._get_data()
+        sc = data.get("slots", {}).get(str(slot_id))
+        if sc is None:
+            return {"error": "unknown slot"}
+        macro = os.path.join(self.config_dir, f"macro_{slot_id}.json")
+        try:
+            with open(macro, "r") as f:
+                events = json.load(f)
+        except Exception:
+            return {"error": "empty"}
+        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in sc.get("name", f"slot {slot_id}")).strip() or f"slot_{slot_id}"
+        path = os.path.join(self._exports_dir(), f"{safe}.json")
+        settings = {k: v for k, v in sc.items() if k not in ("game_id", "game_name")}
+        with open(path, "w") as f:
+            json.dump({"format": "decky-macro/1", "name": sc.get("name"), "settings": settings, "events": events}, f, indent=1)
+        self._give_to_user(path)
+        return {"path": path}
+
+    async def list_exports(self) -> list:
+        folder = self._exports_dir()
+        return sorted(f for f in os.listdir(folder) if f.endswith(".json"))
+
+    async def import_macro(self, filename: str, slot_id: str) -> dict:
+        folder = self._exports_dir()
+        path = os.path.join(folder, os.path.basename(filename))
+        try:
+            with open(path, "r") as f:
+                content = json.load(f)
+            events = content["events"] if isinstance(content, dict) else content
+            if not isinstance(events, list) or not all(isinstance(e, str) and e.count(":") == 3 for e in events):
+                return {"error": "not a Decky Macro file"}
+        except Exception as e:
+            return {"error": str(e)}
+        self._write_macro(slot_id, events)
+        data = self._get_data()
+        if isinstance(content, dict) and str(slot_id) in data.get("slots", {}):
+            for k, v in (content.get("settings") or {}).items():
+                if k != "name":
+                    data["slots"][str(slot_id)][k] = v
+            await self.save_slots_data(data)
+        return {"events": len(events)}
+
+    # --- A9: editing ---------------------------------------------------------------
+
+    def _write_macro(self, slot_id, events):
+        path = os.path.join(self.config_dir, f"macro_{slot_id}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(events, f)
+        os.replace(tmp, path)
+        Plugin.stats_version += 1
+        self._reload_daemon()
+
+    async def delete_macro_event(self, slot_id: str, index: int) -> dict:
+        """Removes one event. Deleting a press also removes its matching
+        release (and the other way round), so nothing stays held."""
+        events = _read_macro(os.path.join(self.config_dir, f"macro_{slot_id}.json"))
+        if not 0 <= index < len(events):
+            return {"error": "index"}
+        _, etype, code, value = events[index]
+        remove = {index}
+        if etype == 1 and value in (0, 1):
+            step = 1 if value == 1 else -1
+            i = index + step
+            while 0 <= i < len(events):
+                if events[i][1] == 1 and events[i][2] == code and events[i][3] == 1 - value:
+                    remove.add(i)
+                    break
+                i += step
+        kept = [e for i, e in enumerate(events) if i not in remove]
+        self._write_macro(slot_id, [f"{d}:{t}:{c}:{v}" for d, t, c, v in kept])
+        return {"removed": len(remove), "events": len(kept)}
+
+    async def trim_macro_start(self, slot_id: str) -> dict:
+        """Removes the wait before the first event."""
+        events = _read_macro(os.path.join(self.config_dir, f"macro_{slot_id}.json"))
+        if not events:
+            return {"error": "empty"}
+        first = events[0][0]
+        self._write_macro(slot_id, [f"{d - first}:{t}:{c}:{v}" for d, t, c, v in events])
+        return {"trimmed_ms": first}
 
     async def get_diagnostics(self) -> dict:
         running = await self.get_daemon_state()
@@ -453,9 +621,13 @@ class Plugin:
             return "?"
 
     async def get_notifications(self) -> list:
-        res = self.notifications.copy()
-        self.notifications.clear()
+        with Plugin.lock:
+            res, self.notifications = self.notifications, []
         return res
+
+    def _notify(self, message, error=False):
+        with Plugin.lock:
+            self.notifications.append({"message": message, "error": error})
 
     async def get_config(self) -> dict:
         config = dict(DEFAULT_CONFIG)
@@ -499,12 +671,18 @@ class Plugin:
         try:
             # Delete the macro of removed slots, so a new slot reusing the id
             # doesn't inherit it.
-            old_ids = set(self._get_data().get("slots", {}).keys())
+            old_data = self._get_data()
+            old_ids = set(old_data.get("slots", {}).keys())
             new_ids = set(data.get("slots", {}).keys())
+            recording = Plugin.daemon_state.get("mode") == "recording" and self.get_daemon_state_sync()
+            if recording and str(old_data.get("active_slot")) in (old_ids - new_ids):
+                self._notify("Cannot delete the slot being recorded", error=True)
+                return False
             for sid in old_ids - new_ids:
                 macro = os.path.join(self.config_dir, f"macro_{sid}.json")
                 if os.path.exists(macro):
                     os.remove(macro)
+                    Plugin.stats_version += 1
                     decky_plugin.logger.info(f"Deleted macro of removed slot {sid}")
             tmp = self.data_path + ".tmp"
             with open(tmp, "w") as f:

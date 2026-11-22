@@ -112,6 +112,40 @@ const en = {
   // toasts
   toastTitle: "Decky Macro",
   toastErrorTitle: "Decky Macro (error)",
+  // status (F10/F11)
+  modeIdle: "Waiting for a trigger",
+  modeRecording: "Recording",
+  modePlaying: "Playing {name} · loop {it}{of}",
+  modePicker: "Macro picker open",
+  modeDetecting: "Waiting for a button press",
+  modeStopping: "Stopping",
+  reloadPending: "Changes will apply when the current macro ends.",
+  // slot options (A3, A4, A6, A8)
+  appendRec: "Append new recordings",
+  appendRecDesc: "A new recording is added at the end of this macro instead of replacing it",
+  loopPause: "Pause between loops",
+  loopPauseDesc: "Wait before starting the next loop",
+  maxDuration: "Stop after",
+  maxDurationDesc: "Stops a long playback after this many minutes (0 = never)",
+  minutes: " min",
+  jitter: "Timing variation",
+  jitterDesc: "Moves each event by a random amount, up to ± this many ms (0 = exact)",
+  gameLink: "Select for {game}",
+  gameLinkDesc: "This slot becomes active when this game is running",
+  gameLinked: "Linked to {game}",
+  noGame: "No game running: start one to link it to this slot",
+  // export / import (A7)
+  exportMacro: "Export macro",
+  importMacro: "Import into this slot",
+  exported: "Exported to {path}",
+  importTitle: "Import a macro",
+  importDesc: "Files in ~/decky-macro-exports. The imported macro replaces the one of the active slot.",
+  importNone: "No file found in ~/decky-macro-exports.",
+  imported: "{events} events imported",
+  // editing (A9)
+  trimStart: "Remove the initial wait",
+  deleteEvent: "Delete",
+  deleteEventHint: "Deleting a press also deletes its release.",
 };
 
 export type Key = keyof typeof en;
@@ -216,6 +250,36 @@ const fr: Record<Key, string> = {
   updateTo: "Mettre à jour vers {v}",
   toastTitle: "Decky Macro",
   toastErrorTitle: "Decky Macro (erreur)",
+  modeIdle: "En attente d'un déclencheur",
+  modeRecording: "Enregistrement en cours",
+  modePlaying: "Lecture de {name} · boucle {it}{of}",
+  modePicker: "Sélecteur de macro ouvert",
+  modeDetecting: "En attente d'un appui",
+  modeStopping: "Arrêt en cours",
+  reloadPending: "Les changements s'appliqueront à la fin de la macro en cours.",
+  appendRec: "Ajouter les nouveaux enregistrements",
+  appendRecDesc: "Un nouvel enregistrement s'ajoute à la fin de cette macro au lieu de la remplacer",
+  loopPause: "Pause entre deux boucles",
+  loopPauseDesc: "Attente avant de relancer la boucle suivante",
+  maxDuration: "Arrêter après",
+  maxDurationDesc: "Arrête une longue lecture après ce nombre de minutes (0 = jamais)",
+  minutes: " min",
+  jitter: "Variation du timing",
+  jitterDesc: "Décale chaque événement au hasard, jusqu'à ± ce nombre de ms (0 = exact)",
+  gameLink: "Sélectionner pour {game}",
+  gameLinkDesc: "Ce slot devient actif quand ce jeu est lancé",
+  gameLinked: "Associé à {game}",
+  noGame: "Aucun jeu lancé : lance-en un pour l'associer à ce slot",
+  exportMacro: "Exporter la macro",
+  importMacro: "Importer dans ce slot",
+  exported: "Exportée dans {path}",
+  importTitle: "Importer une macro",
+  importDesc: "Fichiers de ~/decky-macro-exports. La macro importée remplace celle du slot actif.",
+  importNone: "Aucun fichier dans ~/decky-macro-exports.",
+  imported: "{events} événements importés",
+  trimStart: "Supprimer l'attente du début",
+  deleteEvent: "Suppr.",
+  deleteEventHint: "Supprimer un appui supprime aussi son relâchement.",
 };
 
 // Backend toast messages (English) and their French versions.
@@ -237,6 +301,8 @@ const toastsFr: Record<string, string> = {
   "Macro picker: cannot read the gamepad": "Sélecteur : impossible de lire la manette",
   "Macro picker overlay could not start (see picker-overlay.log)": "Le sélecteur n'a pas pu s'afficher (voir picker-overlay.log)",
   "No button press detected": "Aucun appui détecté",
+  "Cannot delete the slot being recorded": "Impossible de supprimer le slot en cours d'enregistrement",
+  "Playback stopped: time limit reached": "Lecture arrêtée : durée maximale atteinte",
 };
 
 let current: Lang = "en";
@@ -275,6 +341,8 @@ export function t(key: Key, params: Record<string, string | number> = {}): strin
 export function tToast(message: string): string {
   if (current !== "fr") return message;
   if (toastsFr[message]) return toastsFr[message];
+  const slot = /^Slot selected for (.+): (.+)$/.exec(message);
+  if (slot) return `Slot sélectionné pour ${slot[1]} : ${slot[2]}`;
   const set = /^(Record|Replay|Picker) trigger set to (.+)$/.exec(message);
   if (set) {
     const which = { Record: "d'enregistrement", Replay: "de lecture", Picker: "du sélecteur" }[set[1] as "Record"];

@@ -8,7 +8,9 @@ import {
   ButtonItem,
   TextField,
   showModal,
-  ConfirmModal
+  ConfirmModal,
+  DialogButton,
+  Router
 } from "@decky/ui";
 import {
   callable,
@@ -30,9 +32,27 @@ const setDaemonState = callable<[is_running: boolean], boolean>("set_daemon_stat
 const getVersion = callable<[], string>("get_version");
 const detectTrigger = callable<[which: string], { code?: number; label?: string; device?: string; error?: string }>("detect_trigger");
 const getSlotStats = callable<[], Record<string, { events: number; duration_ms: number }>>("get_slot_stats");
-const getMacroPreview = callable<[slotId: string], { count: number; duration_ms: number; rows: { t: number; input: string; action: string }[] }>("get_macro_preview");
+const getMacroPreview = callable<[slotId: string], { count: number; duration_ms: number; rows: { i: number; t: number; input: string; action: string }[] }>("get_macro_preview");
 const getDiagnostics = callable<[], { running: boolean; version: string; triggers: Record<string, any>; lines: string[] }>("get_diagnostics");
 const getNotifications = callable<[], { message: string; error?: boolean }[]>("get_notifications");
+type DaemonStatus = { running: boolean; state: any; stats_version: number };
+const getStatus = callable<[], DaemonStatus>("get_status");
+const setRunningGame = callable<[appId: string, name: string], string>("set_running_game");
+const exportMacro = callable<[slotId: string], { path?: string; error?: string }>("export_macro");
+const listExports = callable<[], string[]>("list_exports");
+const importMacro = callable<[filename: string, slotId: string], { events?: number; error?: string }>("import_macro");
+const deleteMacroEvent = callable<[slotId: string, index: number], { removed?: number; error?: string }>("delete_macro_event");
+const trimMacroStart = callable<[slotId: string], { trimmed_ms?: number; error?: string }>("trim_macro_start");
+
+/** The game in the foreground, if any (A6). */
+const runningGame = (): { id: string; name: string } | null => {
+  try {
+    const app: any = (Router as any).MainRunningApp;
+    return app?.appid ? { id: String(app.appid), name: String(app.display_name ?? app.appid) } : null;
+  } catch {
+    return null;
+  }
+};
 
 // Back buttons: the game doesn't receive them (Steam's virtual pad has none).
 const BACK_BUTTONS = [548, 549, 550, 551];
@@ -172,6 +192,13 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
   const [cancel, setCancel] = useState(initialData?.cancel_on_input ?? true);
   const [recordAnalog, setRecordAnalog] = useState(initialData?.record_analog ?? true);
   const [cardinalOnly, setCardinalOnly] = useState(initialData?.cardinal_only ?? false);
+  const [append, setAppend] = useState<boolean>(initialData?.record_append ?? false);
+  const [loopPause, setLoopPause] = useState<number>(initialData?.loop_pause_ms ?? 0);
+  const [maxMinutes, setMaxMinutes] = useState<number>(initialData?.max_minutes ?? 0);
+  const [jitter, setJitter] = useState<number>(initialData?.jitter_ms ?? 0);
+  const game = runningGame();
+  const [gameId, setGameId] = useState<string>(initialData?.game_id ?? "");
+  const [gameName, setGameName] = useState<string>(initialData?.game_name ?? "");
 
   return (
     <ConfirmModal
@@ -185,6 +212,12 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
           cancel_on_input: cancel,
           record_analog: recordAnalog,
           cardinal_only: cardinalOnly,
+          record_append: append,
+          loop_pause_ms: loopPause,
+          max_minutes: maxMinutes,
+          jitter_ms: jitter,
+          game_id: gameId,
+          game_name: gameName,
         };
         newData.active_slot = slotId;
         updateSlots(newData);
@@ -242,6 +275,55 @@ const SlotEditModal = ({ slotId, initialData, slotsData, updateSlots, closeModal
           disabled={!recordAnalog}
           onChange={setCardinalOnly}
         />
+        <ToggleField label={t("appendRec")} description={t("appendRecDesc")} checked={append} onChange={setAppend} />
+        <SliderField
+          label={t("loopPause")}
+          description={t("loopPauseDesc")}
+          value={loopPause / 1000}
+          min={0}
+          max={10}
+          step={0.5}
+          showValue={true}
+          valueSuffix="s"
+          onChange={(v: number) => setLoopPause(Math.round(v * 1000))}
+        />
+        <SliderField
+          label={t("maxDuration")}
+          description={t("maxDurationDesc")}
+          value={maxMinutes}
+          min={0}
+          max={180}
+          step={5}
+          showValue={true}
+          valueSuffix={t("minutes")}
+          onChange={(v: number) => setMaxMinutes(Math.round(v))}
+        />
+        <SliderField
+          label={t("jitter")}
+          description={t("jitterDesc")}
+          value={jitter}
+          min={0}
+          max={100}
+          step={5}
+          showValue={true}
+          valueSuffix=" ms"
+          onChange={(v: number) => setJitter(Math.round(v))}
+        />
+        {game ? (
+          <ToggleField
+            label={t("gameLink", { game: game.name })}
+            description={gameId && gameId !== game.id ? t("gameLinked", { game: gameName || gameId }) : t("gameLinkDesc")}
+            checked={gameId === game.id}
+            onChange={(on: boolean) => {
+              setGameId(on ? game.id : "");
+              setGameName(on ? game.name : "");
+            }}
+          />
+        ) : (
+          <div style={{ ...small, marginTop: 8 }}>
+            {gameId ? t("gameLinked", { game: gameName || gameId }) : t("noGame")}
+          </div>
+        )}
       </div>
     </ConfirmModal>
   );
@@ -353,8 +435,8 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
     }
   };
 
-  const detectLabel = (which: string, idle: string) =>
-    detecting === which ? t("detectNow") : daemonRunning ? t("detectStopFirst") : idle;
+  const detectLabel = (which: string, idle: string) => (detecting === which ? t("detectNow") : idle);
+  void daemonRunning;
 
   return (
     <ConfirmModal
@@ -401,7 +483,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
           onChange={(opt: any) => setRecordCode(opt.data)}
         />
         {gameButtonWarning(recordCode)}
-        <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("record")}>
+        <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("record")}>
           {detectLabel("record", t("detectRecord"))}
         </ButtonItem>
         {triggerMode(recordMode, setRecordMode, recordCount, setRecordCount, recordHold, setRecordHold, recordWindow, setRecordWindow)}
@@ -413,7 +495,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
           onChange={(opt: any) => setReplayCode(opt.data)}
         />
         {gameButtonWarning(replayCode)}
-        <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("replay")}>
+        <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("replay")}>
           {detectLabel("replay", t("detectReplay"))}
         </ButtonItem>
         {triggerMode(replayMode, setReplayMode, replayCount, setReplayCount, replayHold, setReplayHold, replayWindow, setReplayWindow)}
@@ -428,7 +510,7 @@ const SettingsModal = ({ initialConfig, onSave, closeModal, daemonRunning }: any
         {pickerCode !== 0 && (
           <>
             {gameButtonWarning(pickerCode)}
-            <ButtonItem layout="below" disabled={!!detecting || daemonRunning} onClick={() => detect("picker")}>
+            <ButtonItem layout="below" disabled={!!detecting} onClick={() => detect("picker")}>
               {detectLabel("picker", t("detectPicker"))}
             </ButtonItem>
             {triggerMode(pickerMode, setPickerMode, pickerCount, setPickerCount, pickerHold, setPickerHold, pickerWindow, setPickerWindow)}
@@ -452,10 +534,14 @@ const InfoModal = ({ closeModal }: any) => (
 const PREVIEW_ROWS = 300;
 
 const PreviewModal = ({ slotId, name, closeModal }: any) => {
-  const [data, setData] = useState<{ count: number; duration_ms: number; rows: { t: number; input: string; action: string }[] } | null>(null);
-  useEffect(() => {
-    getMacroPreview(slotId).then(setData).catch(() => setData({ count: 0, duration_ms: 0, rows: [] }));
-  }, [slotId]);
+  const [data, setData] = useState<{ count: number; duration_ms: number; rows: { i: number; t: number; input: string; action: string }[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = () => getMacroPreview(slotId).then(setData).catch(() => setData({ count: 0, duration_ms: 0, rows: [] }));
+  useEffect(() => { load(); }, [slotId]);
+  const edit = async (fn: () => Promise<any>) => {
+    setBusy(true);
+    try { await fn(); await load(); } finally { setBusy(false); }
+  };
   const cell = { padding: "2px 8px 2px 0", whiteSpace: "nowrap" } as const;
   return (
     <ConfirmModal strTitle={t("previewTitle", { name })} bAlertDialog={true} onOK={closeModal} onCancel={closeModal}>
@@ -469,6 +555,16 @@ const PreviewModal = ({ slotId, name, closeModal }: any) => {
             {t("previewSummary", { events: data.count, duration: formatDuration(data.duration_ms) })}
           </div>
           {data.count > PREVIEW_ROWS && <div style={small}>{t("previewTruncated", { n: PREVIEW_ROWS })}</div>}
+          <div style={{ display: "flex", gap: 8, alignItems: "center", margin: "6px 0" }}>
+            <DialogButton
+              style={{ width: "auto", minWidth: 0, padding: "4px 12px" }}
+              disabled={busy || !data.rows.length || data.rows[0].t === 0}
+              onClick={() => edit(() => trimMacroStart(slotId))}
+            >
+              {t("trimStart")}
+            </DialogButton>
+            <span style={small}>{t("deleteEventHint")}</span>
+          </div>
           <div style={{ maxHeight: "50vh", overflowY: "auto", fontSize: 12 }}>
             <table style={{ borderCollapse: "collapse" }}>
               <thead>
@@ -476,6 +572,7 @@ const PreviewModal = ({ slotId, name, closeModal }: any) => {
                   <th style={cell}>{t("colTime")}</th>
                   <th style={cell}>{t("colInput")}</th>
                   <th style={cell}>{t("colAction")}</th>
+                  <th style={cell}></th>
                 </tr>
               </thead>
               <tbody>
@@ -484,12 +581,54 @@ const PreviewModal = ({ slotId, name, closeModal }: any) => {
                     <td style={cell}>{(r.t / 1000).toFixed(2)} s</td>
                     <td style={cell}>{r.input}</td>
                     <td style={cell}>{r.action}</td>
+                    <td style={cell}>
+                      <DialogButton
+                        style={{ width: "auto", minWidth: 0, padding: "0 10px", height: 24, fontSize: 11 }}
+                        disabled={busy}
+                        onClick={() => edit(() => deleteMacroEvent(slotId, r.i))}
+                      >
+                        {t("deleteEvent")}
+                      </DialogButton>
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </div>
+      )}
+    </ConfirmModal>
+  );
+};
+
+const ImportModal = ({ slotId, closeModal }: any) => {
+  const [files, setFiles] = useState<string[] | null>(null);
+  useEffect(() => { listExports().then(setFiles).catch(() => setFiles([])); }, []);
+  return (
+    <ConfirmModal strTitle={t("importTitle")} bAlertDialog={true} onOK={closeModal} onCancel={closeModal}>
+      <div style={{ ...small, marginBottom: 8 }}>{t("importDesc")}</div>
+      {!files ? (
+        <div>{t("loading")}</div>
+      ) : files.length === 0 ? (
+        <div>{t("importNone")}</div>
+      ) : (
+        files.map((f) => (
+          <ButtonItem
+            key={f}
+            layout="below"
+            onClick={async () => {
+              const res = await importMacro(f, slotId);
+              toaster.toast({
+                title: res.error ? t("toastErrorTitle") : t("toastTitle"),
+                body: res.error ?? t("imported", { events: res.events ?? 0 }),
+                duration: 2500,
+              });
+              closeModal();
+            }}
+          >
+            {f.replace(/\.json$/, "")}
+          </ButtonItem>
+        ))
       )}
     </ConfirmModal>
   );
@@ -526,8 +665,14 @@ function Content() {
   const [slotsData, setSlotsData] = useState<any>(null);
   const [isDaemonRunning, setIsDaemonRunning] = useState<boolean>(false);
   const [stats, setStats] = useState<Record<string, { events: number; duration_ms: number }>>({});
+  const [status, setStatus] = useState<DaemonStatus | null>(null);
 
-  const refreshStats = () => getSlotStats().then(setStats).catch(() => {});
+  // Only replace the stats when they changed, so the slot list isn't rebuilt
+  // (and closed) for nothing.
+  const refreshStats = () =>
+    getSlotStats()
+      .then((next) => setStats((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next)))
+      .catch(() => {});
 
   useEffect(() => {
     getGlobalConfig().then((c) => {
@@ -537,8 +682,23 @@ function Content() {
     getSlotsData().then(setSlotsData);
     getDaemonState().then(setIsDaemonRunning);
     refreshStats();
-    // Recordings change the stats while the panel is open.
-    const timer = setInterval(refreshStats, 3000);
+    // Daemon state every second; stats re-read only when a macro file changed.
+    let lastVersion = -1;
+    const poll = async () => {
+      try {
+        const st = await getStatus();
+        setStatus((prev) => (JSON.stringify(prev) === JSON.stringify(st) ? prev : st));
+        setIsDaemonRunning(st.running);
+        if (st.stats_version !== lastVersion) {
+          lastVersion = st.stats_version;
+          refreshStats();
+        }
+      } catch {
+        // ignore
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 1000);
     return () => clearInterval(timer);
   }, []);
 
@@ -653,6 +813,23 @@ function Content() {
 
   const activeSlotId = slotsData.active_slot;
   const active = slotsData.slots[activeSlotId] || {};
+  const st = status?.state ?? {};
+  const recording = isDaemonRunning && st.mode === "recording";
+  const modeText = (() => {
+    if (!isDaemonRunning) return null;
+    switch (st.mode) {
+      case "recording": return t("modeRecording");
+      case "playing": {
+        const name = st.picker_name || active.name || activeSlotId;
+        const of = Number(st.loops) > 0 ? ` / ${st.loops}` : "";
+        return t("modePlaying", { name, it: st.iteration ?? 1, of });
+      }
+      case "picker": return t("modePicker");
+      case "detecting": return t("modeDetecting");
+      case "stopping": return t("modeStopping");
+      default: return t("modeIdle");
+    }
+  })();
   const activeStats = stats[activeSlotId];
   const loops = Number(active.loops || 0);
   const speed = Number(active.speed ?? 1);
@@ -675,6 +852,14 @@ function Content() {
               <span style={{ color: "#00ffcc" }}>{t("running")}</span>
             ) : (
               <span style={{ color: "#ffcc00" }}>{t("stopped")}</span>
+            )}
+            {modeText && (
+              <div style={{ color: st.mode === "recording" ? "#ff6666" : st.mode === "playing" ? "#00ffcc" : "#ccc" }}>
+                {modeText}
+              </div>
+            )}
+            {isDaemonRunning && st.reload_pending && (
+              <div style={{ ...small, color: "#ffcc00" }}>{t("reloadPending")}</div>
             )}
           </div>
         </PanelSectionRow>
@@ -723,8 +908,25 @@ function Content() {
             </ButtonItem>
             <ButtonItem
               layout="below"
+              onClick={async () => {
+                const res = await exportMacro(activeSlotId);
+                toaster.toast({
+                  title: res.error ? t("toastErrorTitle") : t("toastTitle"),
+                  body: res.error ? res.error : t("exported", { path: res.path ?? "" }),
+                  duration: 3000,
+                });
+              }}
+              disabled={!activeStats || activeStats.events === 0}
+            >
+              {t("exportMacro")}
+            </ButtonItem>
+            <ButtonItem layout="below" onClick={() => showModal(<ImportModal slotId={activeSlotId} />)}>
+              {t("importMacro")}
+            </ButtonItem>
+            <ButtonItem
+              layout="below"
               onClick={handleDelete}
-              disabled={activeSlotId === "0"}
+              disabled={activeSlotId === "0" || recording}
             >
               {t("deleteSlot")}
             </ButtonItem>
@@ -768,6 +970,17 @@ export default definePlugin(() => {
   // Toasts can arrive before the panel is opened: pick the language now.
   getGlobalConfig().then((c) => setLanguage(c?.language)).catch(() => setLanguage("auto"));
 
+  // A6: when the foreground game changes, select the slot linked to it.
+  let lastGame = "";
+  const gameTimer = setInterval(() => {
+    const game = runningGame();
+    const id = game?.id ?? "";
+    if (id !== lastGame) {
+      lastGame = id;
+      if (id) setRunningGame(id, game?.name ?? "").catch(() => {});
+    }
+  }, 2000);
+
   const interval = setInterval(async () => {
     try {
       const res = await getNotifications();
@@ -796,6 +1009,7 @@ export default definePlugin(() => {
     icon: <FaGamepad />,
     onDismount() {
       clearInterval(interval);
+      clearInterval(gameTimer);
     },
   };
 });
